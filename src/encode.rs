@@ -110,3 +110,116 @@ pub fn encode_file(input: &Path, output: &Path, x: f64) -> Result<(), DecayError
 
     write_decayfmt(output, Header::new(file_type), &payload)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{FILE_TYPE_TEXT, HEADER_SIZE, MAGIC, VERSION};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Builds a unique path in the system temp directory so concurrent test runs do
+    /// not collide. The suffix carries the extension the test needs.
+    fn unique_temp_path(suffix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("decayfmt_test_{}_{}", nanos, suffix))
+    }
+
+    #[test]
+    fn validate_x_accepts_positive_values() {
+        for x in [0.5, 1.0, 3.0, 10.0, 1000.0] {
+            assert!(validate_x(x).is_ok(), "x = {} should be accepted", x);
+        }
+    }
+
+    #[test]
+    fn validate_x_rejects_non_positive_and_non_finite() {
+        for x in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                matches!(validate_x(x), Err(DecayError::XNotPositive { .. })),
+                "x = {} should be rejected with XNotPositive",
+                x
+            );
+        }
+    }
+
+    #[test]
+    fn file_type_is_detected_from_output_extension() {
+        assert_eq!(
+            file_type_from_output(Path::new("photo.idcy3")).expect("idcy is an image"),
+            FileType::Image
+        );
+        assert_eq!(
+            file_type_from_output(Path::new("note.tdcy7")).expect("tdcy is text"),
+            FileType::Text
+        );
+    }
+
+    #[test]
+    fn unrecognized_output_extension_is_refused() {
+        for name in ["photo.png", "note.txt", "noextension"] {
+            assert!(
+                matches!(
+                    file_type_from_output(Path::new(name)),
+                    Err(DecayError::UnrecognizedExtension { .. })
+                ),
+                "'{}' should be refused",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn encode_text_writes_header_and_exact_payload() {
+        let source = b"the quick brown fox jumps over the lazy dog";
+        let input = unique_temp_path("source.txt");
+        let output = unique_temp_path("note.tdcy3");
+        fs::write(&input, source).expect("write test source");
+
+        encode_file(&input, &output, 3.0).expect("encode text should succeed");
+
+        let written = fs::read(&output).expect("read encoded file");
+        assert_eq!(&written[0..4], &MAGIC, "magic bytes must be DCYF");
+        assert_eq!(written[4], VERSION, "version byte must match");
+        assert_eq!(written[5], FILE_TYPE_TEXT, "file_type byte must be text");
+        assert_eq!(
+            &written[HEADER_SIZE..],
+            source,
+            "text payload must match source bytes exactly"
+        );
+
+        let _ = fs::remove_file(&input);
+        let _ = fs::remove_file(&output);
+    }
+
+    #[test]
+    fn encode_image_payload_length_matches_dimensions() {
+        // A known 2x2 image has a payload of exactly width * height * 4 bytes.
+        let width = 2u32;
+        let height = 2u32;
+        let source_image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([x as u8 * 10, y as u8 * 10, 20, 255])
+        });
+        let input = unique_temp_path("source.png");
+        let output = unique_temp_path("photo.idcy3");
+        source_image.save(&input).expect("save test png");
+
+        encode_file(&input, &output, 3.0).expect("encode image should succeed");
+
+        let written = fs::read(&output).expect("read encoded file");
+        assert_eq!(&written[0..4], &MAGIC, "magic bytes must be DCYF");
+        assert_eq!(written[4], VERSION, "version byte must match");
+        let payload_len = written.len() - HEADER_SIZE;
+        assert_eq!(
+            payload_len,
+            (width * height * 4) as usize,
+            "image payload must be width * height * 4 bytes"
+        );
+
+        let _ = fs::remove_file(&input);
+        let _ = fs::remove_file(&output);
+    }
+}
