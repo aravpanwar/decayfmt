@@ -1,0 +1,7 @@
+/target
+
+# Documentation lives locally and is never committed.
+CLAUDE.md
+project.md
+architecture.md
+milestone.md

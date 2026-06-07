@@ -1,0 +1,12 @@
+[package]
+name = "decayfmt"
+version = "0.1.0"
+edition = "2021"
+description = "A file format where decay is a first-class property. Every open permanently corrupts the file."
+license = "MIT"
+
+[dependencies]
+rand = "0.8"
+
+[profile.release]
+strip = true
