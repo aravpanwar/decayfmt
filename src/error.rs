@@ -50,6 +50,22 @@ pub enum DecayError {
 
     /// The instability value x parsed from the filename was not a positive number.
     XNotPositive { value: f64 },
+
+    /// A filesystem read or write failed. The context names the component and the
+    /// operation; the source is the underlying operating system error.
+    Io {
+        context: String,
+        source: std::io::Error,
+    },
+
+    /// The source given to encode could not be decoded as a supported image. The
+    /// context carries the underlying decoder message, kept as a string so this
+    /// error type stays free of any image-crate dependency.
+    ImageDecode { context: String },
+
+    /// The output filename for encode had an extension that is neither an image
+    /// (idcy) nor a text (tdcy) decayfmt extension, so the file type is unknown.
+    UnrecognizedExtension { extension: String },
 }
 
 impl fmt::Display for DecayError {
@@ -94,8 +110,24 @@ impl fmt::Display for DecayError {
                 "open: instability check failed: x = {} is not a positive number.",
                 value
             ),
+            DecayError::Io { context, source } => write!(f, "{}: {}", context, source),
+            DecayError::ImageDecode { context } => write!(f, "{}", context),
+            DecayError::UnrecognizedExtension { extension } => write!(
+                f,
+                "encode: output extension '{}' is neither an image (idcy) nor a text (tdcy) decayfmt extension.",
+                extension
+            ),
         }
     }
 }
 
-impl std::error::Error for DecayError {}
+impl std::error::Error for DecayError {
+    /// Exposes the underlying operating system error for the Io variant so callers
+    /// can inspect the cause chain. Other variants have no further source.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DecayError::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
