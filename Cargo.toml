@@ -6,6 +6,8 @@ description = "A file format where decay is a first-class property. Every open p
 license = "MIT"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
 rand = "0.8"
 
 [profile.release]
