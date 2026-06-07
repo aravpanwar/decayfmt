@@ -6,5 +6,6 @@
 //! them. The CLI binary and its encode and open flows are added in later milestones.
 
 pub mod corrupt;
+pub mod encode;
 pub mod error;
 pub mod format;
