@@ -18,8 +18,7 @@ struct Cli {
     command: Command,
 }
 
-/// The subcommands decayfmt exposes. Only encode exists today; open is added in a
-/// later milestone.
+/// The subcommands decayfmt exposes.
 #[derive(Subcommand)]
 enum Command {
     /// Encode a source image or text file into a decayfmt file.
@@ -34,6 +33,11 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Open a decayfmt file: corrupt it in place on disk, then display it.
+    Open {
+        /// Path to the decayfmt file to open. x is read from its extension.
+        file: PathBuf,
+    },
 }
 
 /// Parses the command line and runs the chosen subcommand. On error, prints the
@@ -42,6 +46,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Encode { input, x, output } => decayfmt::encode::encode_file(&input, &output, x),
+        Command::Open { file } => decayfmt::open::open_file(&file),
     };
 
     match result {
