@@ -15,11 +15,9 @@ const EXPECTED_MAGIC: &[u8; 4] = b"DCYF";
 
 /// The complete set of failures decayfmt can produce.
 ///
-/// Some variants are produced by modules built in later milestones (encode, open).
-/// They are declared here now because the error model is a single deliverable: the
-/// full contract of how decayfmt fails is fixed up front, not grown ad hoc. The
-/// allow below acknowledges that not every variant is constructed yet.
-#[allow(dead_code)]
+/// The full contract of how decayfmt fails lives in one place: every error any
+/// module returns is a variant here, each naming the component, operation, and
+/// condition that failed.
 #[derive(Debug)]
 pub enum DecayError {
     /// The file did not start with the magic bytes DCYF. The file is not a
@@ -66,6 +64,15 @@ pub enum DecayError {
     /// The output filename for encode had an extension that is neither an image
     /// (idcy) nor a text (tdcy) decayfmt extension, so the file type is unknown.
     UnrecognizedExtension { extension: String },
+
+    /// On open, the image payload length did not match the width and height in the
+    /// header, so the bytes cannot be interpreted as a complete image. The file is
+    /// truncated or otherwise inconsistent with its own header.
+    PayloadSizeMismatch { expected: usize, found: usize },
+
+    /// On open, the corrupted image could not be re-encoded for display. The context
+    /// carries the underlying encoder message as a string.
+    ImageEncode { context: String },
 }
 
 impl fmt::Display for DecayError {
@@ -117,6 +124,12 @@ impl fmt::Display for DecayError {
                 "encode: output extension '{}' is neither an image (idcy) nor a text (tdcy) decayfmt extension.",
                 extension
             ),
+            DecayError::PayloadSizeMismatch { expected, found } => write!(
+                f,
+                "open: image payload check failed: header expects {} bytes of pixels but the payload is {} bytes. The file is truncated or inconsistent.",
+                expected, found
+            ),
+            DecayError::ImageEncode { context } => write!(f, "{}", context),
         }
     }
 }
