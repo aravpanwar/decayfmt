@@ -9,3 +9,4 @@ pub mod corrupt;
 pub mod encode;
 pub mod error;
 pub mod format;
+pub mod open;
