@@ -47,17 +47,19 @@ fn file_type_from_output(output: &Path) -> Result<FileType, DecayError> {
     }
 }
 
-/// Decodes a source image's bytes into a raw RGBA payload.
+/// Decodes a source image's bytes into its pixel dimensions and a raw RGBA payload.
 ///
 /// The image crate accepts any format it supports (PNG, JPEG, and others) and is
 /// reduced here to raw RGBA, four bytes per pixel, which is exactly what the
-/// decayfmt payload stores. The payload is the pixel data only; width and height
-/// are not part of it and, in the current header layout, are not stored anywhere.
-fn image_payload(source_bytes: &[u8], input: &Path) -> Result<Vec<u8>, DecayError> {
+/// decayfmt payload stores. The dimensions are returned alongside so the header can
+/// record them; the payload is the pixel data only and does not encode its own size.
+fn decode_image(source_bytes: &[u8], input: &Path) -> Result<(u32, u32, Vec<u8>), DecayError> {
     let decoded = image::load_from_memory(source_bytes).map_err(|error| DecayError::ImageDecode {
         context: format!("encode: decode image '{}': {}", input.display(), error),
     })?;
-    Ok(decoded.to_rgba8().into_raw())
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Ok((width, height, rgba.into_raw()))
 }
 
 /// Produces a raw text payload from source bytes, requiring valid UTF-8.
@@ -103,18 +105,21 @@ pub fn encode_file(input: &Path, output: &Path, x: f64) -> Result<(), DecayError
         source: error,
     })?;
 
-    let payload = match file_type {
-        FileType::Image => image_payload(&source_bytes, input)?,
-        FileType::Text => text_payload(source_bytes)?,
+    let (header, payload) = match file_type {
+        FileType::Image => {
+            let (width, height, payload) = decode_image(&source_bytes, input)?;
+            (Header::for_image(width, height), payload)
+        }
+        FileType::Text => (Header::for_text(), text_payload(source_bytes)?),
     };
 
-    write_decayfmt(output, Header::new(file_type), &payload)
+    write_decayfmt(output, header, &payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{FILE_TYPE_TEXT, HEADER_SIZE, MAGIC, VERSION};
+    use crate::format::{ImageDimensions, FILE_TYPE_TEXT, HEADER_SIZE, MAGIC, VERSION};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -217,6 +222,13 @@ mod tests {
             payload_len,
             (width * height * 4) as usize,
             "image payload must be width * height * 4 bytes"
+        );
+
+        let header = Header::read(&written).expect("encoded header must parse");
+        assert_eq!(
+            header.dimensions,
+            Some(ImageDimensions { width, height }),
+            "header must record the source image dimensions"
         );
 
         let _ = fs::remove_file(&input);
