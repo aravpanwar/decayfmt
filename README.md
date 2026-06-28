@@ -13,6 +13,15 @@ Two file types:
 `x` is a positive integer in the filename, the instability parameter. Higher `x` means
 more corruption per open.
 
+## Watch it decay
+
+One image, encoded at `x=3`, then opened. Each open corrupts it further on disk,
+permanently, before it is ever shown. There is no way back.
+
+| Original | After 1 open | After 3 opens |
+| :---: | :---: | :---: |
+| ![Original](assets/original.png) | ![After one open](assets/after-1-open.png) | ![After three opens](assets/after-3-opens.png) |
+
 ## What this is, and is not
 
 decayfmt is a social contract enforced by math, not cryptography. It is not encryption,
