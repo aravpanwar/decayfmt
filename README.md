@@ -1,9 +1,11 @@
 # decayfmt
 
-A file format where decay is a first-class property. Every time you open a decayfmt
-file it permanently corrupts a little, by an amount baked into the filename. There is
-no recovery from the file alone. The file is the only copy that matters, and every read
-destroys a little more of it.
+**A file format that corrupts itself a little every time you open it.** Every open
+permanently damages the file on disk, by an amount baked into the filename, before it is
+ever shown to you. There is no recovery from the file alone. The file is the only copy
+that matters, and every read destroys a little more of it.
+
+![The same image, encoded at four instability values and opened in step, decaying at four speeds at once](assets/decay-grid.gif)
 
 Two file types:
 
@@ -15,8 +17,10 @@ more corruption per open.
 
 ## Watch it decay
 
-The same image, encoded at two instability values, then opened. Each open corrupts it
-further on disk, permanently, before it is ever shown. There is no way back.
+The grid above is one image encoded at `x=1`, `x=3`, `x=8`, and `x=15`, each opened the
+same number of times. Same picture, four rates of decay. To follow a single instability
+value across individual opens instead, each open corrupting the file further on disk
+before it is ever shown, with no way back:
 
 The clean original:
 
