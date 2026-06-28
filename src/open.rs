@@ -10,6 +10,7 @@
 use crate::corrupt::corrupt;
 use crate::error::DecayError;
 use crate::format::{Header, ImageDimensions, HEADER_SIZE};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,13 +74,14 @@ fn ensure_writable(path: &Path) -> Result<(), DecayError> {
     Ok(())
 }
 
-/// Opens a decayfmt file: corrupts its payload in place on disk, then displays it.
+/// Corrupts a decayfmt file in place on disk and returns its header and the new
+/// file bytes.
 ///
-/// Upholds the contract ordering: parse x, verify writability, corrupt, persist,
-/// then display. The header is read but never changed; only the payload is
-/// corrupted and written back. Display happens strictly after the corrupted bytes
-/// are on disk.
-pub fn open_file(path: &Path) -> Result<(), DecayError> {
+/// This is the persisted half of the open flow and the part that upholds the
+/// contract: parse x, verify writability, corrupt the payload, write it back. It
+/// performs no display, so the corruption it commits never depends on anything
+/// being shown. The header is read but never changed; only the payload is corrupted.
+fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
     let x = parse_x_from_filename(path)?;
     ensure_writable(path)?;
 
@@ -94,32 +96,54 @@ pub fn open_file(path: &Path) -> Result<(), DecayError> {
     // and is left untouched; everything after it is the payload.
     corrupt(&mut file_bytes[HEADER_SIZE..], header.file_type, x);
 
-    // Persist the corruption before displaying anything. This is the point of no
-    // return: once this write lands, the previous payload state is gone for good.
+    // Persist the corruption. This is the point of no return: once this write
+    // lands, the previous payload state is gone for good.
     std::fs::write(path, &file_bytes).map_err(|error| DecayError::Io {
         context: format!("open: write corrupted payload to '{}'", path.display()),
         source: error,
     })?;
 
-    // Display the now-corrupted payload. Dimensions are present exactly for images,
-    // so their presence selects the display path.
+    Ok((header, file_bytes))
+}
+
+/// Opens a decayfmt file: corrupts its payload in place on disk, then displays it.
+///
+/// Upholds the contract ordering: the file is corrupted and persisted first, then
+/// displayed. Dimensions are present exactly for images, so their presence selects
+/// the display path.
+pub fn open_file(path: &Path) -> Result<(), DecayError> {
+    let (header, file_bytes) = decay_in_place(path)?;
     let payload = &file_bytes[HEADER_SIZE..];
     match header.dimensions {
         Some(dimensions) => display_image(payload, dimensions),
-        None => {
-            display_text(payload);
-            Ok(())
-        }
+        None => display_text(payload),
     }
 }
 
-/// Prints a corrupted text payload to stdout.
+/// Displays a corrupted text payload.
 ///
 /// The payload may no longer be valid UTF-8 after corruption, so it is rendered
 /// lossily: invalid byte sequences become the Unicode replacement character rather
 /// than causing a failure. Corruption is allowed to break the text; display is not.
-fn display_text(payload: &[u8]) {
-    print!("{}", String::from_utf8_lossy(payload));
+///
+/// The text is always written to stdout. When stdout is not a terminal, for example
+/// when decayfmt was launched from a file manager, that output goes nowhere, so the
+/// same text is also written to a temporary file and opened in the system's default
+/// text editor. This keeps the result visible without a console.
+fn display_text(payload: &[u8]) -> Result<(), DecayError> {
+    let text = String::from_utf8_lossy(payload);
+    print!("{}", text);
+
+    if std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+
+    let viewer_path = temporary_output_path("txt");
+    std::fs::write(&viewer_path, text.as_bytes()).map_err(|error| DecayError::Io {
+        context: format!("open: write display text '{}'", viewer_path.display()),
+        source: error,
+    })?;
+    open_in_default_app(&viewer_path)
 }
 
 /// Re-encodes a corrupted RGBA payload to a temporary PNG and opens it in the
@@ -138,7 +162,7 @@ fn display_image(payload: &[u8], dimensions: ImageDimensions) -> Result<(), Deca
             found: payload.len(),
         })?;
 
-    let viewer_path = temporary_png_path();
+    let viewer_path = temporary_output_path("png");
     image.save(&viewer_path).map_err(|error| DecayError::ImageEncode {
         context: format!(
             "open: encode display png '{}': {}",
@@ -147,27 +171,29 @@ fn display_image(payload: &[u8], dimensions: ImageDimensions) -> Result<(), Deca
         ),
     })?;
 
-    launch_viewer(&viewer_path)
+    open_in_default_app(&viewer_path)
 }
 
-/// Builds a unique path in the system temp directory for the display PNG. The file
-/// is left for the operating system to reclaim, since the viewer is launched
-/// asynchronously and we cannot know when it has finished reading the file.
-fn temporary_png_path() -> PathBuf {
+/// Builds a unique path in the system temp directory for a display file with the
+/// given extension. The file is left for the operating system to reclaim, since the
+/// viewer is launched asynchronously and we cannot know when it has finished
+/// reading the file.
+fn temporary_output_path(extension: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("decayfmt_view_{}.png", nanos))
+    std::env::temp_dir().join(format!("decayfmt_view_{}.{}", nanos, extension))
 }
 
-/// Hands a file to the operating system's default image viewer.
+/// Hands a file to the operating system's default application for its type, used
+/// for both the display PNG and the display text file.
 ///
 /// Each platform exposes a different one-shot "open with the default application"
-/// command. The viewer is spawned and not waited on, so it stays open after this
-/// returns. A failure to launch is reported, though by this point the corruption
-/// has already been written to disk.
-fn launch_viewer(path: &Path) -> Result<(), DecayError> {
+/// command. The application is spawned and not waited on, so it stays open after
+/// this returns. A failure to launch is reported, though by this point the
+/// corruption has already been written to disk.
+fn open_in_default_app(path: &Path) -> Result<(), DecayError> {
     let spawn_result = if cfg!(target_os = "windows") {
         // On Windows, start is a cmd builtin; its first quoted argument is treated
         // as a window title, so an empty title is passed before the file path.
@@ -182,7 +208,7 @@ fn launch_viewer(path: &Path) -> Result<(), DecayError> {
     };
 
     spawn_result.map(|_child| ()).map_err(|error| DecayError::Io {
-        context: format!("open: launch image viewer for '{}'", path.display()),
+        context: format!("open: launch default viewer for '{}'", path.display()),
         source: error,
     })
 }
@@ -251,7 +277,9 @@ mod tests {
         let before = fs::read(&decay_file).expect("read encoded file");
         let payload_before = before[HEADER_SIZE..].to_vec();
 
-        open_file(&decay_file).expect("open should succeed");
+        // decay_in_place is the persisted half of open, without the display step,
+        // so the test exercises the corruption write without spawning a viewer.
+        decay_in_place(&decay_file).expect("decay should succeed");
 
         let after = fs::read(&decay_file).expect("read opened file");
         let payload_after = &after[HEADER_SIZE..];
@@ -282,7 +310,7 @@ mod tests {
         fs::set_permissions(&decay_file, permissions).expect("set read-only");
 
         assert!(
-            matches!(open_file(&decay_file), Err(DecayError::ReadOnly { .. })),
+            matches!(decay_in_place(&decay_file), Err(DecayError::ReadOnly { .. })),
             "a read-only file must be refused"
         );
 
@@ -304,7 +332,7 @@ mod tests {
         fs::write(&decay_file, [0u8; 32]).expect("write bogus file");
 
         assert!(
-            matches!(open_file(&decay_file), Err(DecayError::WrongMagic { .. })),
+            matches!(decay_in_place(&decay_file), Err(DecayError::WrongMagic { .. })),
             "a file without the magic bytes must be refused"
         );
 
@@ -316,7 +344,7 @@ mod tests {
         // The path need not exist: parsing x fails before any file access.
         let missing = Path::new("this_file_does_not_exist.txt");
         assert!(matches!(
-            open_file(missing),
+            decay_in_place(missing),
             Err(DecayError::FilenameNoX { .. })
         ));
     }
