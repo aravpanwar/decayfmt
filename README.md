@@ -15,12 +15,21 @@ more corruption per open.
 
 ## Watch it decay
 
-One image, encoded at `x=3`, then opened. Each open corrupts it further on disk,
-permanently, before it is ever shown. There is no way back.
+The same image, encoded at two instability values, then opened. Each open corrupts it
+further on disk, permanently, before it is ever shown. There is no way back.
 
-| Original | After 1 open | After 3 opens |
+The clean original:
+
+![Original](assets/original.png)
+
+| Instability | After 1 open | After 3 opens |
 | :---: | :---: | :---: |
-| ![Original](assets/original.png) | ![After one open](assets/after-1-open.png) | ![After three opens](assets/after-3-opens.png) |
+| `x=3` (gentle) | ![x3 after one open](assets/x3-after-1.png) | ![x3 after three opens](assets/x3-after-3.png) |
+| `x=10` (severe) | ![x10 after one open](assets/x10-after-1.png) | ![x10 after three opens](assets/x10-after-3.png) |
+
+At `x=3` the image degrades gracefully over many opens. At `x=10` it is nearly gone after
+one open and pure noise after three. `x` is the dial between a slow fade and near-instant
+destruction.
 
 ## What this is, and is not
 
