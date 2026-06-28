@@ -56,7 +56,9 @@ Images are decoded to raw RGBA; text must be valid UTF-8.
 ### Open
 
 Open a decayfmt file. This corrupts it in place on disk, then displays the result.
-Images open in your system's default image viewer; text prints to the terminal.
+Images open in your system's default image viewer. Text prints to the terminal, and
+when there is no terminal (for example when launched from a file manager) it also
+opens in your default text editor.
 
 ```
 decayfmt open photo.idcy3
