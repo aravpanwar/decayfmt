@@ -1,5 +1,8 @@
 /target
 
+# Locally generated decay demo frames, kept out of the repo.
+/demo
+
 # Documentation lives locally and is never committed.
 CLAUDE.md
 project.md
