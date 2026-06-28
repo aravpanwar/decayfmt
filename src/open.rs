@@ -186,3 +186,138 @@ fn launch_viewer(path: &Path) -> Result<(), DecayError> {
         source: error,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::encode_file;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Builds a unique path in the system temp directory so concurrent test runs do
+    /// not collide. The suffix carries the extension the test needs.
+    fn unique_temp_path(suffix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("decayfmt_open_test_{}_{}", nanos, suffix))
+    }
+
+    #[test]
+    fn x_is_parsed_from_image_and_text_extensions() {
+        assert_eq!(
+            parse_x_from_filename(Path::new("photo.idcy3")).expect("idcy3 parses"),
+            3.0
+        );
+        assert_eq!(
+            parse_x_from_filename(Path::new("note.tdcy12")).expect("tdcy12 parses"),
+            12.0
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_x_is_refused() {
+        for name in ["plain.png", "note.txt", "no_extension", "photo.idcy", "photo.idcyx"] {
+            assert!(
+                matches!(
+                    parse_x_from_filename(Path::new(name)),
+                    Err(DecayError::FilenameNoX { .. })
+                ),
+                "'{}' should yield FilenameNoX",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn zero_x_is_refused_as_not_positive() {
+        assert!(matches!(
+            parse_x_from_filename(Path::new("photo.idcy0")),
+            Err(DecayError::XNotPositive { .. })
+        ));
+    }
+
+    #[test]
+    fn open_changes_the_payload_on_disk() {
+        // Encode a text file, capture its clean payload, open it, then confirm the
+        // payload bytes on disk are no longer what they were.
+        let source = vec![b'a'; 4096];
+        let input = unique_temp_path("source.txt");
+        let decay_file = unique_temp_path("note.tdcy5");
+        fs::write(&input, &source).expect("write test source");
+        encode_file(&input, &decay_file, 5.0).expect("encode should succeed");
+
+        let before = fs::read(&decay_file).expect("read encoded file");
+        let payload_before = before[HEADER_SIZE..].to_vec();
+
+        open_file(&decay_file).expect("open should succeed");
+
+        let after = fs::read(&decay_file).expect("read opened file");
+        let payload_after = &after[HEADER_SIZE..];
+        assert_ne!(
+            payload_after, payload_before,
+            "payload must differ on disk after open"
+        );
+
+        let _ = fs::remove_file(&input);
+        let _ = fs::remove_file(&decay_file);
+    }
+
+    // Restoring writability after the test uses set_readonly(false), which clippy
+    // warns is platform-dependent. That is acceptable here: it only exists so the
+    // read-only test file can be deleted again on platforms that need it.
+    #[allow(clippy::permissions_set_readonly_false)]
+    #[test]
+    fn read_only_file_is_refused() {
+        let input = unique_temp_path("source.txt");
+        let decay_file = unique_temp_path("note.tdcy3");
+        fs::write(&input, b"some text").expect("write test source");
+        encode_file(&input, &decay_file, 3.0).expect("encode should succeed");
+
+        let mut permissions = fs::metadata(&decay_file)
+            .expect("stat decay file")
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&decay_file, permissions).expect("set read-only");
+
+        assert!(
+            matches!(open_file(&decay_file), Err(DecayError::ReadOnly { .. })),
+            "a read-only file must be refused"
+        );
+
+        // Restore writability so the file can be cleaned up.
+        let mut permissions = fs::metadata(&decay_file)
+            .expect("stat decay file")
+            .permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(&decay_file, permissions);
+        let _ = fs::remove_file(&input);
+        let _ = fs::remove_file(&decay_file);
+    }
+
+    #[test]
+    fn wrong_magic_is_refused() {
+        // A writable file with a valid x suffix but bogus header bytes must be
+        // refused at header validation, after the writability check passes.
+        let decay_file = unique_temp_path("bogus.tdcy3");
+        fs::write(&decay_file, [0u8; 32]).expect("write bogus file");
+
+        assert!(
+            matches!(open_file(&decay_file), Err(DecayError::WrongMagic { .. })),
+            "a file without the magic bytes must be refused"
+        );
+
+        let _ = fs::remove_file(&decay_file);
+    }
+
+    #[test]
+    fn filename_without_x_is_refused_before_touching_the_file() {
+        // The path need not exist: parsing x fails before any file access.
+        let missing = Path::new("this_file_does_not_exist.txt");
+        assert!(matches!(
+            open_file(missing),
+            Err(DecayError::FilenameNoX { .. })
+        ));
+    }
+}
