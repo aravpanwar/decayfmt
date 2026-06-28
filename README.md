@@ -31,6 +31,21 @@ At `x=3` the image degrades gracefully over many opens. At `x=10` it is nearly g
 one open and pure noise after three. `x` is the dial between a slow fade and near-instant
 destruction.
 
+Text decays the same way. A sentence encoded at `x=1` (a slow burn), printed after a few
+opens:
+
+```text
+original : It was the best of times, it was the worst of times.
+ open 1  : It was the best og times,/it!was the worst of times.
+ open 3  : It_was the best2op times,/ih!wRs the worst of times.
+ open 6  : I)_was thefb1st2op ti,es,/ih!w+> 0he worsBVwflti0es.
+ open 9  : I)+was thefb}st2op tive<,/ih!w+>;0bemAorsBVw-It`0es.
+ open 12 : I)+was ~hefb}sQlop tiv\b"/ih!w+>;0be9AVrsBVK-8d`0es.
+```
+
+Corruption only ever swaps in printable characters, so text garbles into readable-looking
+nonsense rather than binary noise.
+
 ## What this is, and is not
 
 decayfmt is a social contract enforced by math, not cryptography. It is not encryption,
