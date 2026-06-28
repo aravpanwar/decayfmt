@@ -1,0 +1,56 @@
+name: release
+
+# Build and publish binaries when a version tag is pushed. Each target is built on
+# a native runner, tested, packaged, and attached to the GitHub Release for the tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+# The release upload needs permission to write to the repository's releases.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: test
+        run: cargo test --release
+
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        run: tar -czf "decayfmt-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" decayfmt
+
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/decayfmt.exe" -DestinationPath "decayfmt-${{ matrix.target }}.zip"
+
+      - name: attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: decayfmt-${{ matrix.target }}.*
