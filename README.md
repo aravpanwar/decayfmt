@@ -35,12 +35,12 @@ Text decays the same way. A sentence encoded at `x=1` (a slow burn), printed aft
 opens:
 
 ```text
-original : It was the best of times, it was the worst of times.
- open 1  : It was the best og times,/it!was the worst of times.
- open 3  : It_was the best2op times,/ih!wRs the worst of times.
- open 6  : I)_was thefb1st2op ti,es,/ih!w+> 0he worsBVwflti0es.
- open 9  : I)+was thefb}st2op tive<,/ih!w+>;0bemAorsBVw-It`0es.
- open 12 : I)+was ~hefb}sQlop tiv\b"/ih!w+>;0be9AVrsBVK-8d`0es.
+original : This sentence is dying, and every time you read it you kill it a little more.
+ open 1  : This sgntence is d+ingd !nd every time you re&p it P~u kiKl it a little more}
+ open 3  : This sgfxFn0e is d+ingd 3D6 every tibe you re&" it P~u kiKl it a 1ittl> m1re}
+ open 6  : TIbm sgf}Fn0e ts d+iqgd yD6 ev*ry tibe you re&" )t Pnu kiKB )t aC1it"l> m1^e}
+ open 9  : T/Sm sgf}Fk0- ts d|iqgd HD6 e@*rV tiFe you re&" )t Pnu kiKB )tpaC1it"lYMm1^>}
+ open 12 : h/Sm hgf}Nk0-'ts?K|iqgd HD6 e@`~V}t&Fe y%u re&" )2 Pnu kiKB )6UaC1it1lYMm1]b!
 ```
 
 Corruption only ever swaps in printable characters, so text garbles into readable-looking
