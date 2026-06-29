@@ -122,6 +122,11 @@ seeded, so two opens of the same state look different.
 - **Text:** each byte is replaced, with probability `p`, by a random printable ASCII
   byte. This operates on bytes, not characters, so at high `x` it can break UTF-8; the
   viewer renders what it can and substitutes the replacement character for the rest.
+  Corruption substitutes bytes in place and never inserts or deletes, so the file length
+  and the positions of untouched bytes are preserved: content decays but structure does
+  not. The original byte length is always recoverable, and at low `x` word lengths and
+  layout largely survive. Spaces are not protected; they are replaced at the same rate as
+  any other byte and erode along with everything else as `x` rises.
 
 ## The contract
 
