@@ -59,6 +59,14 @@ original, keep a backup. If you do not want anyone to recover it, do not make on
 
 ## Install
 
+### With cargo
+
+If you have a Rust toolchain, the quickest install is the published crate:
+
+```
+cargo install decayfmt
+```
+
 ### From a release
 
 Download the binary for your platform from the
