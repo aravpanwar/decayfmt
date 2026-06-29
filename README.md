@@ -65,6 +65,9 @@ Download the binary for your platform from the
 [releases page](https://github.com/aravpanwar/decayfmt/releases) and put it on your PATH.
 There is no runtime dependency to install.
 
+On macOS the binary is unsigned, so the first run may be blocked by Gatekeeper. Right-click
+it and choose Open, or clear the quarantine flag with `xattr -d com.apple.quarantine decayfmt`.
+
 ### From source
 
 Requires a Rust toolchain.
@@ -74,6 +77,20 @@ cargo build --release
 ```
 
 The binary is produced at `target/release/decayfmt`.
+
+## Quickstart
+
+See it decay in your terminal, with no image or sample file needed:
+
+```
+echo "this sentence is about to start dying" > note.txt
+decayfmt encode --input note.txt --x 8 --output note.tdcy8
+decayfmt open note.tdcy8
+```
+
+Run that last line a few more times and watch the sentence rot further on each open. The
+corruption is written to disk before it prints, so there is no way back. A high `x` like 8
+garbles it fast; a low `x` like 1 is a slow burn over many opens.
 
 ## Usage
 
