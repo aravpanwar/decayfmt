@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "A file format where decay is a first-class property. Every open permanently corrupts the file."
 license = "MIT"
+repository = "https://github.com/aravpanwar/decayfmt"
+readme = "README.md"
+keywords = ["file-format", "corruption", "decay", "cli", "entropy"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = ["assets/", ".github/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
