@@ -85,6 +85,31 @@ pub enum DecayError {
     /// On open, the corrupted image could not be re-encoded for display. The context
     /// carries the underlying encoder message as a string.
     ImageEncode { context: String },
+
+    /// A v2 header is internally inconsistent or out of range: a field combination
+    /// that violates the v2 format invariants, for example an unbound header carrying
+    /// sealed blobs, a bound header carrying a wrapped key, or a field that must be
+    /// non-zero (like `n_max` or a bound header's `nv_index`) that is zero.
+    InvalidHeaderV2 { reason: String },
+
+    /// A cryptographic primitive failed: key derivation, key wrapping, or AEAD
+    /// encryption/decryption. Authentication failures (wrong passphrase/key, tampered
+    /// ciphertext, mismatched AAD) surface here rather than panicking.
+    Crypto { context: String },
+
+    /// A TPM operation failed: context / TCTI initialization, sealing or unsealing the
+    /// content key, loading the sealed object, or generating the storage parent. The
+    /// context names the operation; it never carries secret material.
+    Tpm { context: String },
+
+    /// A TPM NV counter operation failed (define/increment/read/undefine). Distinct from
+    /// [`DecayError::Tpm`] so NV counter errors fail closed and are reported precisely.
+    NvCounter { context: String },
+
+    /// A caller-supplied argument is invalid: a zero `n_max`, a `--max-opens` value given
+    /// for a v1 output name, or a similar usage error. Kept distinct from format errors so
+    /// CLI/API misuse is reported precisely rather than as a malformed file.
+    InvalidArgument { context: String },
 }
 
 impl fmt::Display for DecayError {
@@ -92,36 +117,30 @@ impl fmt::Display for DecayError {
         match self {
             DecayError::WrongMagic { found } => write!(
                 f,
-                "format: magic check failed: expected {:?} (DCYF), found {:?}. This is not a decayfmt file.",
-                EXPECTED_MAGIC, found
+                "format: magic check failed: expected {EXPECTED_MAGIC:?} (DCYF), found {found:?}. This is not a decayfmt file."
             ),
             DecayError::UnsupportedVersion { found } => write!(
                 f,
-                "format: version check failed: version 0x{:02x} is not supported by this build. Refusing to guess at forward compatibility.",
-                found
+                "format: version check failed: version 0x{found:02x} is not supported by this build. Refusing to guess at forward compatibility."
             ),
             DecayError::UnsupportedFileType { found } => write!(
                 f,
-                "format: file_type check failed: 0x{:02x} is neither image (0x01) nor text (0x02).",
-                found
+                "format: file_type check failed: 0x{found:02x} is neither image (0x01) nor text (0x02)."
             ),
             DecayError::MismatchedFileType {
                 extension_kind,
                 header_kind,
             } => write!(
                 f,
-                "open: type check failed: the filename extension indicates {} but the header says {}. Refusing to guess which is correct.",
-                extension_kind, header_kind
+                "open: type check failed: the filename extension indicates {extension_kind} but the header says {header_kind}. Refusing to guess which is correct."
             ),
             DecayError::ReadOnly { path } => write!(
                 f,
-                "open: writability check failed: '{}' is read-only. Corruption cannot be written, so the file will not be displayed.",
-                path
+                "open: writability check failed: '{path}' is read-only. Corruption cannot be written, so the file will not be displayed."
             ),
             DecayError::PayloadTooSmall { found, needed } => write!(
                 f,
-                "format: header read failed: buffer is {} bytes but the header needs {} bytes.",
-                found, needed
+                "format: header read failed: buffer is {found} bytes but the header needs {needed} bytes."
             ),
             DecayError::InvalidUtf8 => write!(
                 f,
@@ -129,33 +148,36 @@ impl fmt::Display for DecayError {
             ),
             DecayError::FilenameNoX { filename } => write!(
                 f,
-                "open: filename parse failed: '{}' contains no positive instability value x in its extension.",
-                filename
+                "open: filename parse failed: '{filename}' contains no positive instability value x in its extension."
             ),
             DecayError::XNotPositive { value } => write!(
                 f,
-                "open: instability check failed: x = {} is not a positive number.",
-                value
+                "open: instability check failed: x = {value} is not a positive number."
             ),
             DecayError::XOutOfRange { value } => write!(
                 f,
-                "open: filename parse failed: instability value x = '{}' is too large; the maximum is {}.",
-                value,
+                "open: filename parse failed: instability value x = '{value}' is too large; the maximum is {}.",
                 u32::MAX
             ),
-            DecayError::Io { context, source } => write!(f, "{}: {}", context, source),
-            DecayError::ImageDecode { context } => write!(f, "{}", context),
+            DecayError::Io { context, source } => write!(f, "{context}: {source}"),
+            DecayError::ImageDecode { context } => write!(f, "{context}"),
             DecayError::UnrecognizedExtension { extension } => write!(
                 f,
-                "encode: output extension '{}' is neither an image (idcy) nor a text (tdcy) decayfmt extension.",
-                extension
+                "encode: output extension '{extension}' is neither an image (idcy) nor a text (tdcy) decayfmt extension."
             ),
             DecayError::PayloadSizeMismatch { expected, found } => write!(
                 f,
-                "open: image payload check failed: header expects {} bytes of pixels but the payload is {} bytes. The file is truncated or inconsistent.",
-                expected, found
+                "open: image payload check failed: header expects {expected} bytes of pixels but the payload is {found} bytes. The file is truncated or inconsistent."
             ),
-            DecayError::ImageEncode { context } => write!(f, "{}", context),
+            DecayError::ImageEncode { context } => write!(f, "{context}"),
+            DecayError::InvalidHeaderV2 { reason } => write!(
+                f,
+                "format: invalid v2 header: {reason}"
+            ),
+            DecayError::Crypto { context } => write!(f, "crypto: {context}"),
+            DecayError::Tpm { context } => write!(f, "tpm: {context}"),
+            DecayError::NvCounter { context } => write!(f, "tpm nv counter: {context}"),
+            DecayError::InvalidArgument { context } => write!(f, "invalid argument: {context}"),
         }
     }
 }

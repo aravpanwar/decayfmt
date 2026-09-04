@@ -11,26 +11,14 @@ categories = ["command-line-utilities", "filesystem"]
 exclude = ["assets/", ".github/"]
 
 [dependencies]
+aes-gcm = "0.10"
 clap = { version = "4", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = [
-    "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm",
-    "qoi", "tga", "tiff", "webp",
-] }
+fs2 = "0.4"
+image = "0.25"
 rand = "0.8"
-rayon = "1"
+zeroize = { version = "1", features = ["derive", "alloc"] }
+tss-esapi = { version = "7", features = ["generate-bindings"] }
 
 [profile.release]
 strip = true
 
-[[bench]]
-name = "corrupt"
-harness = false
-
-[[bench]]
-name = "encode"
-harness = false
-
-[workspace]
-members = ["python"]
-default-members = ["."]
-resolver = "2"
