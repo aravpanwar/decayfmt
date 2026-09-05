@@ -22,3 +22,8 @@ tss-esapi = { version = "7", features = ["generate-bindings"] }
 [profile.release]
 strip = true
 
+# TEMPORARY: rebuild decayfmt against vendored Tbs-enabled tss-esapi on Windows.
+[patch.crates-io]
+tss-esapi-sys = { path = "vendor/tss-esapi-sys" }
+tss-esapi = { path = "vendor/tss-esapi" }
+

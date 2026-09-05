@@ -19,8 +19,9 @@ use std::process::ExitCode;
 )]
 struct Cli {
     /// Optional TSS2 TCTI configuration to connect to, for example
-    /// `swtpm:host=127.0.0.1,port=2321`. When omitted the default TPM device
-    /// (`/dev/tpmrm0`) is used. Only affects v2 (bare `.idcy`/`.tdcy`) files.
+    /// `swtpm:host=127.0.0.1,port=2321`. When omitted the platform's default TPM backend is
+    /// used (Windows TBS; `/dev/tpmrm0` elsewhere), so it can normally be left out. Only
+    /// affects v2 (bare `.idcy`/`.tdcy`) files.
     #[arg(long, global = true)]
     tcti: Option<String>,
 
@@ -42,10 +43,6 @@ enum Command {
         /// file and requires -v2.
         #[arg(long)]
         output: PathBuf,
-        /// Maximum number of opens for a v2 output (default 10). Requires -v2 and a bare
-        /// .idcy/.tdcy output name; must be greater than zero.
-        #[arg(long, requires = "v2")]
-        max_opens: Option<u32>,
         /// Opt into the TPM-backed v2 format: an encrypted, hardware-bound file whose decay
         /// is enforced by a TPM monotonic counter. Only v2 output names (bare .idcy/.tdcy)
         /// may be used with it.
@@ -64,12 +61,9 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Encode {
-            input,
-            output,
-            max_opens,
-            v2,
-        } => decayfmt::encode::encode(&input, &output, max_opens, v2, cli.tcti.as_deref()),
+        Command::Encode { input, output, v2 } => {
+            decayfmt::encode::encode(&input, &output, v2, cli.tcti.as_deref())
+        }
         Command::Open { file } => decayfmt::open::open_file(&file, cli.tcti.as_deref()),
     };
 

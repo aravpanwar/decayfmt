@@ -57,8 +57,8 @@ pub const HEADER_SIZE: usize = RESERVED_OFFSET + RESERVED_LEN;
 
 /// Size of the fixed portion of a v2 header, before the two variable-length
 /// sealed-object fields: 4 (magic) + 2 (version) + 1 (file_type) + 4 (width)
-/// + 4 (height) + 4 (nv_index) + 8 (c0) + 4 (n_max) + 12 (payload_nonce).
-pub const HEADER_V2_FIXED_LEN: usize = 4 + 2 + 1 + 4 + 4 + 4 + 8 + 4 + 12;
+/// + 4 (height) + 4 (nv_index) + 8 (c0) + 12 (payload_nonce) + 32 (nv_auth).
+pub const HEADER_V2_FIXED_LEN: usize = 4 + 2 + 1 + 4 + 4 + 4 + 8 + 12 + 32;
 
 /// Which kind of payload follows the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,8 +99,8 @@ impl FileType {
 /// The v2 header: the encrypted, TPM-hardware-bound format. A v2 file is always bound
 /// to a TPM at encode time; there is no passphrase or portable key. It carries the
 /// payload type, dimensions, the TPM NV counter identity, the initial counter value,
-/// the maximum number of opens, the single payload nonce, and the serialized public
-/// and private portions of the TPM sealed object that holds the content key K.
+/// the single payload nonce, and the serialized public and private portions of the TPM
+/// sealed object that holds the content key K.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderV2 {
     pub file_type: FileType,
@@ -108,8 +108,11 @@ pub struct HeaderV2 {
     pub height: u32,
     pub nv_index: u32,
     pub c0: u64,
-    pub n_max: u32,
     pub payload_nonce: [u8; 12],
+    /// The per-file NV authorization value (32 random bytes) needed to read/increment the
+    /// counter. Stored in the header by design (it is not a secret or encryption key); the
+    /// security boundary is the TPM-backed monotonic counter.
+    pub nv_auth: [u8; 32],
     pub sealed_pub: Vec<u8>,
     pub sealed_priv: Vec<u8>,
 }
@@ -131,10 +134,10 @@ impl HeaderV2 {
         height: u32,
         nv_index: u32,
         c0: u64,
-        n_max: u32,
         payload_nonce: [u8; 12],
         sealed_pub: Vec<u8>,
         sealed_priv: Vec<u8>,
+        nv_auth: [u8; 32],
     ) -> Self {
         HeaderV2 {
             file_type,
@@ -142,8 +145,8 @@ impl HeaderV2 {
             height,
             nv_index,
             c0,
-            n_max,
             payload_nonce,
+            nv_auth,
             sealed_pub,
             sealed_priv,
         }
@@ -152,15 +155,10 @@ impl HeaderV2 {
     /// Validates the internal consistency of a v2 header.
     ///
     /// A v2 file is always TPM-bound, so it must carry non-empty sealed public and
-    /// private parts and a non-zero `nv_index`; `n_max` must be non-zero; and every
-    /// variable-length blob must stay within the maximum blob size. Returns a typed
-    /// [`DecayError`] naming the first violated invariant.
+    /// private parts and a non-zero `nv_index`; every variable-length blob must stay
+    /// within the maximum blob size. Returns a typed [`DecayError`] naming the first
+    /// violated invariant.
     pub fn validate(&self) -> Result<(), DecayError> {
-        if self.n_max == 0 {
-            return Err(DecayError::InvalidHeaderV2 {
-                reason: "n_max must be greater than zero".to_string(),
-            });
-        }
         if self.nv_index == 0 {
             return Err(DecayError::InvalidHeaderV2 {
                 reason: "a bound v2 header requires a non-zero nv_index".to_string(),
@@ -217,8 +215,8 @@ impl HeaderV2 {
         out.extend_from_slice(&self.height.to_le_bytes());
         out.extend_from_slice(&self.nv_index.to_le_bytes());
         out.extend_from_slice(&self.c0.to_le_bytes());
-        out.extend_from_slice(&self.n_max.to_le_bytes());
         out.extend_from_slice(&self.payload_nonce);
+        out.extend_from_slice(&self.nv_auth);
 
         write_blob(out, Some(self.sealed_pub.as_slice()));
         write_blob(out, Some(self.sealed_priv.as_slice()));
@@ -251,9 +249,8 @@ impl HeaderV2 {
 
         let nv_index = u32::from_le_bytes(take::<4>(bytes, &mut pos)?);
         let c0 = u64::from_le_bytes(take::<8>(bytes, &mut pos)?);
-        let n_max = u32::from_le_bytes(take::<4>(bytes, &mut pos)?);
-
         let payload_nonce = take::<12>(bytes, &mut pos)?;
+        let nv_auth = take::<32>(bytes, &mut pos)?;
 
         let sealed_pub = read_blob(bytes, &mut pos)?;
         let sealed_priv = read_blob(bytes, &mut pos)?;
@@ -264,8 +261,8 @@ impl HeaderV2 {
             height,
             nv_index,
             c0,
-            n_max,
             payload_nonce,
+            nv_auth,
             sealed_pub,
             sealed_priv,
         };
@@ -279,7 +276,7 @@ impl HeaderV2 {
     ///
     /// This is exactly the canonical serialized v2 header bytes produced by
     /// [`HeaderV2::write`], so the payload is bound to every header field: magic,
-    /// version, file type, dimensions, `nv_index`, `c0`, `n_max`, the payload nonce, and
+    /// version, file type, dimensions, `nv_index`, `c0`, the payload nonce, and
     /// the TPM sealed object. It deliberately excludes the payload/ciphertext. Callers
     /// pass these exact bytes as the AAD to both the payload encrypt and decrypt
     /// primitives so the two operations authenticate the same bytes.
@@ -685,6 +682,9 @@ mod tests {
     /// A small, valid payload nonce used in HeaderV2 tests.
     const TEST_NONCE: [u8; 12] = [0xCD; 12];
 
+    /// A small, valid 32-byte NV authorization value used in HeaderV2 tests.
+    const TEST_NV_AUTH: [u8; 32] = [0xAB; 32];
+
     /// Returns a minimal valid v2 (TPM-bound) header for HeaderV2 tests.
     fn valid_header() -> HeaderV2 {
         HeaderV2::new(
@@ -693,10 +693,10 @@ mod tests {
             2,
             7,
             12345,
-            10,
             TEST_NONCE,
             vec![4, 5, 6],
             vec![7, 8, 9],
+            TEST_NV_AUTH,
         )
     }
 
@@ -708,8 +708,8 @@ mod tests {
         assert_eq!(header.height, 2);
         assert_eq!(header.nv_index, 7);
         assert_eq!(header.c0, 12345);
-        assert_eq!(header.n_max, 10);
         assert_eq!(header.payload_nonce, TEST_NONCE);
+        assert_eq!(header.nv_auth, TEST_NV_AUTH);
         assert_eq!(header.sealed_pub, vec![4, 5, 6]);
         assert_eq!(header.sealed_priv, vec![7, 8, 9]);
     }
@@ -722,25 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn n_max_zero_is_rejected() {
-        let header = HeaderV2::new(
-            FileType::Text,
-            0,
-            0,
-            7,
-            12345,
-            0,
-            TEST_NONCE,
-            vec![4],
-            vec![5],
-        );
-        assert!(matches!(
-            header.validate(),
-            Err(DecayError::InvalidHeaderV2 { .. })
-        ));
-    }
-
-    #[test]
     fn zero_nv_index_is_rejected() {
         let header = HeaderV2::new(
             FileType::Text,
@@ -748,10 +729,10 @@ mod tests {
             0,
             0,
             12345,
-            10,
             TEST_NONCE,
             vec![4],
             vec![5],
+            TEST_NV_AUTH,
         );
         assert!(matches!(
             header.validate(),
@@ -767,10 +748,10 @@ mod tests {
             0,
             7,
             12345,
-            10,
             TEST_NONCE,
             Vec::new(),
             vec![5],
+            TEST_NV_AUTH,
         );
         assert!(matches!(
             header.validate(),
@@ -786,10 +767,10 @@ mod tests {
             0,
             7,
             12345,
-            10,
             TEST_NONCE,
             vec![4],
             Vec::new(),
+            TEST_NV_AUTH,
         );
         assert!(matches!(
             header.validate(),
@@ -805,10 +786,10 @@ mod tests {
             0,
             7,
             12345,
-            10,
             TEST_NONCE,
             vec![0u8; HeaderV2::MAX_BLOB_LEN + 1],
             vec![5],
+            TEST_NV_AUTH,
         );
         assert!(matches!(
             header.validate(),
@@ -899,20 +880,23 @@ mod tests {
     }
 
     #[test]
-    fn v2_payload_nonce_is_serialized_in_layout_order() {
+    fn v2_fixed_fields_are_serialized_in_layout_order() {
         let header = valid_header();
         let mut bytes = Vec::new();
         header.write(&mut bytes).expect("write header");
 
-        // payload_nonce is the last fixed field, at offset 31 in a 43-byte fixed region.
+        // payload_nonce sits at offset 27 in the fixed region, followed by the 32-byte
+        // nv_auth at offset 39.
         assert_eq!(
-            &bytes[31..43],
+            &bytes[27..39],
             &TEST_NONCE[..],
-            "payload_nonce at offset 31"
+            "payload_nonce at offset 27"
         );
+        assert_eq!(&bytes[39..71], &TEST_NV_AUTH[..], "nv_auth at offset 39");
 
         let (parsed, _) = HeaderV2::read(&bytes).expect("header must parse");
         assert_eq!(parsed.payload_nonce, TEST_NONCE);
+        assert_eq!(parsed.nv_auth, TEST_NV_AUTH);
     }
 
     #[test]
@@ -955,10 +939,10 @@ mod tests {
             ("height", |h: &mut HeaderV2| h.height += 1),
             ("nv_index", |h: &mut HeaderV2| h.nv_index += 1),
             ("c0", |h: &mut HeaderV2| h.c0 += 1),
-            ("n_max", |h: &mut HeaderV2| h.n_max += 1),
             ("payload_nonce", |h: &mut HeaderV2| {
                 h.payload_nonce[0] ^= 0xFF
             }),
+            ("nv_auth", |h: &mut HeaderV2| h.nv_auth[0] ^= 0xFF),
             ("sealed_pub", |h: &mut HeaderV2| h.sealed_pub[0] ^= 0xFF),
             ("sealed_priv", |h: &mut HeaderV2| h.sealed_priv[0] ^= 0xFF),
         ];

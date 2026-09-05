@@ -18,3 +18,15 @@ project.md
 architecture.md
 milestone.md
 findings.md
+
+# Vendored Cargo build artifacts.
+/vendor/**/target/
+
+# Windows build artifacts.
+/*.exe
+/*.dll
+
+# Temporary Windows prototype tools.
+/src/bin/ms_provision_client.rs
+/src/bin/ms_nv_sample.rs
+/src/bin/ms_seal_sample.rs

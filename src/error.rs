@@ -89,7 +89,7 @@ pub enum DecayError {
     /// A v2 header is internally inconsistent or out of range: a field combination
     /// that violates the v2 format invariants, for example an unbound header carrying
     /// sealed blobs, a bound header carrying a wrapped key, or a field that must be
-    /// non-zero (like `n_max` or a bound header's `nv_index`) that is zero.
+    /// non-zero (like a bound header's `nv_index`) that is zero.
     InvalidHeaderV2 { reason: String },
 
     /// A cryptographic primitive failed: key derivation, key wrapping, or AEAD
@@ -106,9 +106,9 @@ pub enum DecayError {
     /// [`DecayError::Tpm`] so NV counter errors fail closed and are reported precisely.
     NvCounter { context: String },
 
-    /// A caller-supplied argument is invalid: a zero `n_max`, a `--max-opens` value given
-    /// for a v1 output name, or a similar usage error. Kept distinct from format errors so
-    /// CLI/API misuse is reported precisely rather than as a malformed file.
+    /// A caller-supplied argument is invalid: for example the `-v2` flag given for a v1
+    /// (decay-suffixed) output name, or another usage error. Kept distinct from format
+    /// errors so CLI/API misuse is reported precisely rather than as a malformed file.
     InvalidArgument { context: String },
 }
 

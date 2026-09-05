@@ -1,8 +1,10 @@
 //! TPM 2.0 connection and object-sealing layer for the v2 format.
 //!
 //! This module owns the TPM context and is the single entry point for talking to the
-//! platform TPM. For v2.0 the normal Linux path is the kernel resource manager device at
-//! `/dev/tpmrm0`, selected via [`TctiNameConf::Device`].
+//! platform TPM. On Windows the default backend is the Windows TPM Base Services (TBS)
+//! API via [`TctiNameConf::Tbs`]; on other platforms it is the kernel resource manager
+//! device at `/dev/tpmrm0`, selected via [`TctiNameConf::Device`]. An explicit TCTI
+//! (`--tcti`) overrides the default, for example to reach a software TPM.
 //!
 //! Implemented so far: connection, the deterministic owner primary storage key (the parent
 //! for per-file objects), and sealing/loading/unsealing the 256-bit content key `K` into a
@@ -15,6 +17,7 @@ use std::collections::HashSet;
 #[cfg(test)]
 use std::collections::HashMap;
 
+use rand::RngCore;
 use tss_esapi::attributes::{
     NvIndexAttributes, NvIndexAttributesBuilder, ObjectAttributes, ObjectAttributesBuilder,
 };
@@ -24,8 +27,9 @@ use tss_esapi::handles::{KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandl
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
 use tss_esapi::interface_types::key_bits::RsaKeyBits;
 use tss_esapi::interface_types::resource_handles::{Hierarchy, NvAuth, Provision};
+use tss_esapi::interface_types::session_handles::AuthSession;
 use tss_esapi::structures::{
-    CapabilityData, Digest, KeyedHashScheme, NvPublic, Private, Public, PublicBuilder,
+    Auth, CapabilityData, Digest, KeyedHashScheme, NvPublic, Private, Public, PublicBuilder,
     PublicKeyRsa, PublicKeyedHashParameters, PublicRsaParametersBuilder, RsaExponent, RsaScheme,
     SensitiveData, SymmetricDefinitionObject,
 };
@@ -36,10 +40,12 @@ use tss_esapi::Context;
 use crate::crypto::ContentKey;
 use crate::error::DecayError;
 
-/// The Linux TPM 2.0 device node used for the normal v2.0 path.
+/// The Linux TPM 2.0 device node used on non-Windows platforms.
+#[cfg(not(target_os = "windows"))]
 pub const DEVICE_PATH: &str = "/dev/tpmrm0";
 
-/// The full TCTI name (`device:/dev/tpmrm0`) handed to the TCTI loader.
+/// The full TCTI name (`device:/dev/tpmrm0`) handed to the TCTI loader on non-Windows.
+#[cfg(not(target_os = "windows"))]
 const DEVICE_TCTI_NAME: &str = "device:/dev/tpmrm0";
 
 /// Number of NV handles requested per `TPM2_GetCapability` page. This is only a per-request
@@ -61,6 +67,9 @@ pub struct CounterInfo {
     pub nv_index: u32,
     /// The counter's initial value, read from the TPM after definition (the `c0` field).
     pub c0: u64,
+    /// The per-file 32-byte NV authorization value needed to read/increment the counter
+    /// (persisted in the header as `nv_auth`). Not a secret or encryption key.
+    pub nv_auth: [u8; 32],
 }
 
 /// Read metadata about an existing TPM NV index.
@@ -94,11 +103,11 @@ pub trait Tpm {
     /// Validates that `nv_index` exists, is an `NvIndexType::Counter`, and is 8 bytes.
     fn validate_counter(&mut self, nv_index: u32) -> Result<(), DecayError>;
 
-    /// Reads the current u64 value of the counter at `nv_index`.
-    fn read_counter(&mut self, nv_index: u32) -> Result<u64, DecayError>;
+    /// Reads the current u64 value of the counter at `nv_index`, authorizing with `nv_auth`.
+    fn read_counter(&mut self, nv_index: u32, nv_auth: [u8; 32]) -> Result<u64, DecayError>;
 
-    /// Monotonically increments the counter at `nv_index`.
-    fn increment_counter(&mut self, nv_index: u32) -> Result<(), DecayError>;
+    /// Monotonically increments the counter at `nv_index`, authorizing with `nv_auth`.
+    fn increment_counter(&mut self, nv_index: u32, nv_auth: [u8; 32]) -> Result<(), DecayError>;
 
     /// Loads the sealed object from `sealed_pub`/`sealed_priv` and unseals the content key,
     /// returning the raw 32-byte key. The caller zeroizes the returned bytes.
@@ -110,10 +119,22 @@ pub trait Tpm {
 }
 
 impl TpmContext {
+    /// Connects to the platform TPM 2.0 through Windows TPM Base Services (TBS).
+    ///
+    /// This is the default backend on Windows, so ordinary CLI usage needs no `--tcti`.
+    #[cfg(target_os = "windows")]
+    pub fn connect() -> Result<Self, DecayError> {
+        let context = Context::new(TctiNameConf::Tbs).map_err(|error| DecayError::Tpm {
+            context: format!("connect to TPM via Windows TBS: {error}"),
+        })?;
+        Ok(TpmContext { context })
+    }
+
     /// Connects to the platform TPM 2.0 through the kernel resource manager device.
     ///
     /// Uses exactly the device TCTI configuration for `/dev/tpmrm0`. There is no vTPM
     /// detection and no fallback to any other device or library.
+    #[cfg(not(target_os = "windows"))]
     pub fn connect() -> Result<Self, DecayError> {
         let conf: TctiNameConf = DEVICE_TCTI_NAME.parse().map_err(|error| DecayError::Tpm {
             context: format!("parse TCTI name '{DEVICE_TCTI_NAME}': {error}"),
@@ -126,11 +147,10 @@ impl TpmContext {
 
     /// Connects to the TPM using an explicit TCTI configuration.
     ///
-    /// Unlike [`TpmContext::connect`], which always targets the Linux device node
-    /// `/dev/tpmrm0`, this lets the caller choose the transport — for example a software TPM:
-    /// `swtpm:host=127.0.0.1,port=2321`. It exists so tests can drive the same [`TpmContext`]
-    /// against a disposable software TPM; production code should continue to use
-    /// [`TpmContext::connect`].
+    /// Unlike [`TpmContext::connect`], which uses the platform's default backend, this lets
+    /// the caller choose the transport — for example a software TPM:
+    /// `swtpm:host=127.0.0.1,port=2321`. It exists so tests and development can drive the
+    /// same [`TpmContext`] against a disposable software TPM or a specific backend.
     pub fn connect_with_tcti(conf: TctiNameConf) -> Result<Self, DecayError> {
         let context = Context::new(conf).map_err(|error| DecayError::Tpm {
             context: format!("connect to TPM using TCTI: {error}"),
@@ -140,11 +160,12 @@ impl TpmContext {
 
     /// Connects to the TPM, optionally via an explicit TCTI configuration string.
     ///
-    /// When `tcti` is `None`, this is exactly [`TpmContext::connect`] (the default Linux device
-    /// node `/dev/tpmrm0`). When `Some(conf)` is supplied it is parsed as a TSS2 TCTI
-    /// configuration — for example `swtpm:host=127.0.0.1,port=2321` — and used to open a
-    /// [`TpmContext`] via [`TpmContext::connect_with_tcti`]. This lets the CLI expose an optional
-    /// `--tcti` while keeping the default connection path unchanged.
+    /// When `tcti` is `None`, this is exactly [`TpmContext::connect`] — the platform default
+    /// (Windows TBS, or the `/dev/tpmrm0` device elsewhere). When `Some(conf)` is supplied it
+    /// is parsed as a TSS2 TCTI configuration — for example `swtpm:host=127.0.0.1,port=2321` —
+    /// and used to open a [`TpmContext`] via [`TpmContext::connect_with_tcti`]. This lets the
+    /// CLI keep `--tcti` available for testing and development while using the platform default
+    /// when it is omitted.
     pub fn connect_optional(tcti: Option<&str>) -> Result<Self, DecayError> {
         match tcti {
             Some(conf_str) => {
@@ -298,10 +319,11 @@ impl TpmContext {
     /// Allocates and defines a fresh per-file TPM NV counter under the Owner hierarchy.
     ///
     /// Enumerates the TPM's existing NV handles, picks a genuinely unused index in the valid
-    /// NV range, defines an 8-byte `NvIndexType::Counter` index with owner read/write auth
-    /// (no passphrase), reads the TPM's initial counter value, and returns it as `c0`. It never
-    /// redefines an existing index; any define failure is surfaced as a [`DecayError::NvCounter`]
-    /// and the counter is left untouched.
+    /// NV range, defines an 8-byte `NvIndexType::Counter` index with `AUTHREAD | AUTHWRITE`
+    /// attributes and a fresh random 32-byte NV authorization value (returned as `nv_auth` for the
+    /// header), and returns it alongside a logical initial value of `c0 = 0`. It never redefines
+    /// an existing index; any define failure is surfaced as a [`DecayError::NvCounter`] and the
+    /// counter is left untouched.
     pub fn allocate_counter(&mut self) -> Result<CounterInfo, DecayError> {
         let used = self.used_nv_indexes()?;
         let index = pick_unused_nv_index(&used).ok_or_else(|| DecayError::NvCounter {
@@ -309,6 +331,13 @@ impl TpmContext {
         })?;
         let nv_tpm_index = NvIndexTpmHandle::new(index).map_err(|error| DecayError::NvCounter {
             context: format!("invalid NV index {index:#010x}: {error}"),
+        })?;
+        // A fresh random 32-byte NV authorization value authorizes reads/increments of this
+        // counter (persisted in the header as nv_auth; it is not a secret or encryption key).
+        let mut nv_auth = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut nv_auth);
+        let auth = Auth::try_from(nv_auth.to_vec()).map_err(|error| DecayError::NvCounter {
+            context: format!("build NV auth for {index:#010x}: {error}"),
         })?;
         let nv_public = NvPublic::builder()
             .with_nv_index(nv_tpm_index)
@@ -322,7 +351,7 @@ impl TpmContext {
         let nv_handle = self
             .context
             .execute_with_nullauth_session(|ctx| {
-                ctx.nv_define_space(Provision::Owner, None, nv_public)
+                ctx.nv_define_space(Provision::Owner, Some(auth), nv_public)
             })
             .map_err(|error| DecayError::NvCounter {
                 context: format!("define NV counter at {index:#010x}: {error}"),
@@ -334,22 +363,33 @@ impl TpmContext {
         Ok(CounterInfo {
             nv_index: index,
             c0: 0,
+            nv_auth,
         })
     }
 
-    /// Reads the current u64 value of the per-file TPM NV counter at `nv_index`.
-    pub fn read_counter(&mut self, nv_index: u32) -> Result<u64, DecayError> {
+    /// Reads the current u64 value of the per-file TPM NV counter at `nv_index`, authorizing
+    /// with the per-file `nv_auth`.
+    pub fn read_counter(&mut self, nv_index: u32, nv_auth: [u8; 32]) -> Result<u64, DecayError> {
         let nv_handle = self.nv_handle_from_index(nv_index)?;
+        self.authorize_nv_handle(nv_handle, nv_auth)?;
         let value = self.read_counter_from_handle(nv_handle)?;
         self.close_nv_handle(nv_handle)?;
         Ok(value)
     }
 
-    /// Increments the per-file TPM NV counter at `nv_index` (monotonic, on the TPM).
-    pub fn increment_counter(&mut self, nv_index: u32) -> Result<(), DecayError> {
+    /// Increments the per-file TPM NV counter at `nv_index` (monotonic, on the TPM), authorizing
+    /// with the per-file `nv_auth`.
+    pub fn increment_counter(
+        &mut self,
+        nv_index: u32,
+        nv_auth: [u8; 32],
+    ) -> Result<(), DecayError> {
         let nv_handle = self.nv_handle_from_index(nv_index)?;
+        self.authorize_nv_handle(nv_handle, nv_auth)?;
         self.context
-            .execute_with_nullauth_session(|ctx| ctx.nv_increment(NvAuth::Owner, nv_handle))
+            .execute_with_session(Some(AuthSession::Password), |ctx| {
+                ctx.nv_increment(NvAuth::NvIndex(nv_handle), nv_handle)
+            })
             .map_err(|error| DecayError::NvCounter {
                 context: format!("increment NV counter {nv_index:#010x}: {error}"),
             })?;
@@ -403,12 +443,31 @@ impl TpmContext {
         Ok(())
     }
 
-    /// Reads 8 bytes (u64 big-endian, network order) from an open NV counter handle.
+    /// Registers `nv_auth` as the ESYS authorization value for the given NV index handle, so a
+    /// subsequent `NV_Read`/`NV_Increment` issued under a password session authorizes with it.
+    fn authorize_nv_handle(
+        &mut self,
+        nv_handle: NvIndexHandle,
+        nv_auth: [u8; 32],
+    ) -> Result<(), DecayError> {
+        let auth = Auth::try_from(nv_auth.to_vec()).map_err(|error| DecayError::NvCounter {
+            context: format!("build NV auth value: {error}"),
+        })?;
+        self.context
+            .tr_set_auth(ObjectHandle::from(nv_handle), auth)
+            .map_err(|error| DecayError::NvCounter {
+                context: format!("set NV authorization value: {error}"),
+            })
+    }
+
+    /// Reads 8 bytes (u64 big-endian, network order) from an open NV counter handle, using the
+    /// counter's NV index authorization (the auth was registered via [`Self::authorize_nv_handle`]).
     fn read_counter_from_handle(&mut self, nv_handle: NvIndexHandle) -> Result<u64, DecayError> {
         match self
             .context
-            .execute_with_nullauth_session(|ctx| ctx.nv_read(NvAuth::Owner, nv_handle, 8, 0))
-        {
+            .execute_with_session(Some(AuthSession::Password), |ctx| {
+                ctx.nv_read(NvAuth::NvIndex(nv_handle), nv_handle, 8, 0)
+            }) {
             Ok(buffer) => decode_counter_bytes(buffer.value()),
             Err(error) => {
                 // A freshly-defined TPMA_NV_COUNTER may be unreadable until its first increment on
@@ -544,19 +603,22 @@ impl Tpm for TpmContext {
     }
 
     fn allocate_counter(&mut self) -> Result<CounterInfo, DecayError> {
-        TpmContext::allocate_counter(self)
+        // Windows NV provisioning is delegated to the DecayFmtProvisionerTest service over its
+        // named pipe (see `platform_allocate_counter`); every other OS defines the counter on the
+        // local TPM directly. Sealing always happens locally on this same TpmContext.
+        platform_allocate_counter(self)
     }
 
     fn validate_counter(&mut self, nv_index: u32) -> Result<(), DecayError> {
         TpmContext::validate_counter(self, nv_index)
     }
 
-    fn read_counter(&mut self, nv_index: u32) -> Result<u64, DecayError> {
-        TpmContext::read_counter(self, nv_index)
+    fn read_counter(&mut self, nv_index: u32, nv_auth: [u8; 32]) -> Result<u64, DecayError> {
+        TpmContext::read_counter(self, nv_index, nv_auth)
     }
 
-    fn increment_counter(&mut self, nv_index: u32) -> Result<(), DecayError> {
-        TpmContext::increment_counter(self, nv_index)
+    fn increment_counter(&mut self, nv_index: u32, nv_auth: [u8; 32]) -> Result<(), DecayError> {
+        TpmContext::increment_counter(self, nv_index, nv_auth)
     }
 
     fn unseal_content_key(
@@ -567,6 +629,21 @@ impl Tpm for TpmContext {
         let loaded = self.load_sealed_object(sealed_pub, sealed_priv)?;
         TpmContext::unseal_loaded_key(self, loaded)
     }
+}
+
+/// Platform-specific counter allocation used by the `Tpm` implementation for [`TpmContext`].
+///
+/// On Windows this defers to the `DecayFmtProvisionerTest` service over its named pipe (the
+/// production integration, mirroring `src/bin/ms_provision_client.rs`), so the local context never
+/// defines an NV index itself. On every other platform it is the existing direct local allocation.
+#[cfg(target_os = "windows")]
+fn platform_allocate_counter(_ctx: &mut TpmContext) -> Result<CounterInfo, DecayError> {
+    windows_provision::request_allocate_counter()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_allocate_counter(ctx: &mut TpmContext) -> Result<CounterInfo, DecayError> {
+    TpmContext::allocate_counter(ctx)
 }
 
 /// Builds the deterministic `Public` template for the owner primary storage key.
@@ -633,8 +710,8 @@ fn sealed_key_public() -> Result<Public, DecayError> {
 /// counter without a passphrase.
 fn counter_attributes() -> Result<NvIndexAttributes, DecayError> {
     NvIndexAttributesBuilder::new()
-        .with_owner_read(true)
-        .with_owner_write(true)
+        .with_auth_read(true)
+        .with_auth_write(true)
         .with_nv_index_type(NvIndexType::Counter)
         .build()
         .map_err(|error| DecayError::NvCounter {
@@ -736,6 +813,7 @@ impl Tpm for FakeTpm {
         Ok(CounterInfo {
             nv_index: index,
             c0: 0,
+            nv_auth: [0u8; 32],
         })
     }
 
@@ -755,7 +833,7 @@ impl Tpm for FakeTpm {
         }
     }
 
-    fn read_counter(&mut self, nv_index: u32) -> Result<u64, DecayError> {
+    fn read_counter(&mut self, nv_index: u32, _nv_auth: [u8; 32]) -> Result<u64, DecayError> {
         self.call_log.push("read");
         if self.fail_read {
             return Err(DecayError::NvCounter {
@@ -770,7 +848,7 @@ impl Tpm for FakeTpm {
             })
     }
 
-    fn increment_counter(&mut self, nv_index: u32) -> Result<(), DecayError> {
+    fn increment_counter(&mut self, nv_index: u32, _nv_auth: [u8; 32]) -> Result<(), DecayError> {
         self.call_log.push("increment");
         if self.fail_increment {
             return Err(DecayError::NvCounter {
@@ -812,8 +890,10 @@ impl Tpm for FakeTpm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "windows"))]
     use std::ffi::CString;
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn device_tcti_name_selects_the_required_device() {
         // Parsing the TCTI name builds a `Device` configuration without opening the
@@ -928,13 +1008,13 @@ mod tests {
 
         assert!(
             matches!(
-                fake.increment_counter(info.nv_index),
+                fake.increment_counter(info.nv_index, info.nv_auth),
                 Err(DecayError::NvCounter { .. })
             ),
             "incrementing a counter already at u64::MAX must fail closed"
         );
         assert_eq!(
-            fake.read_counter(info.nv_index).unwrap(),
+            fake.read_counter(info.nv_index, info.nv_auth).unwrap(),
             u64::MAX,
             "the counter must remain at u64::MAX after a failed increment"
         );
@@ -974,7 +1054,8 @@ mod tests {
         let mut fake = FakeTpm::new();
         let info = fake.allocate_counter().expect("allocate counter");
         assert_eq!(info.c0, 0);
-        assert_eq!(fake.read_counter(info.nv_index).unwrap(), 0);
+        assert_eq!(info.nv_auth.len(), 32);
+        assert_eq!(fake.read_counter(info.nv_index, info.nv_auth).unwrap(), 0);
     }
 
     #[test]
@@ -994,5 +1075,215 @@ mod tests {
         // custom-TCTI construction path here and never fabricate a TPM error. When a daemon is
         // listening this constructs the TpmContext (Ok); otherwise it is a no-op for this host.
         let _tpm = TpmContext::connect_with_tcti(conf);
+    }
+}
+
+/// Windows-only: provisions a fresh NV counter by asking the DecayFmtProvisionerTest Windows
+/// service over its named pipe, instead of defining the counter on the local TPM.
+///
+/// This is the production counterpart of `src/bin/ms_provision_client.rs`: it connects to
+/// `\\.\pipe\decayfmt-provision-test`, sends exactly `AllocateCounter\n`, and parses the service's
+/// `OK nv_index=0x... c0=...\n` reply. It performs no sealing and no other TPM work; the local
+/// `TpmContext` still seals the content key itself against the Windows TPM (TBS). The same
+/// hand-written Win32 FFI style is used (no extra dependency), and the module only compiles on
+/// Windows so Linux/macOS behaviour is unchanged.
+#[cfg(target_os = "windows")]
+mod windows_provision {
+    use std::os::raw::c_void;
+
+    use super::{CounterInfo, DecayError};
+
+    /// The named pipe served by the `DecayFmtProvisionerTest` Windows service.
+    const PIPE_NAME: &str = r"\\.\pipe\decayfmt-provision-test";
+
+    // CreateFileW constants (winnt.h / winbase.h).
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+
+    const MAX_RESPONSE_BYTES: usize = 4096;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut c_void,
+        ) -> *mut c_void;
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+        fn ReadFile(
+            h_file: *mut c_void,
+            lp_buffer: *mut u8,
+            n_number_of_bytes_to_read: u32,
+            lp_number_of_bytes_read: *mut u32,
+            lp_overlapped: *mut c_void,
+        ) -> i32;
+        fn WriteFile(
+            h_file: *mut c_void,
+            lp_buffer: *const u8,
+            n_number_of_bytes_to_write: u32,
+            lp_number_of_bytes_written: *mut u32,
+            lp_overlapped: *mut c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    /// Asks the provisioner service to allocate a fresh NV counter, returning its identity.
+    pub(super) fn request_allocate_counter() -> Result<CounterInfo, DecayError> {
+        let pipe_name = to_wide(PIPE_NAME);
+        let handle = unsafe {
+            CreateFileW(
+                pipe_name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return Err(DecayError::NvCounter {
+                context: format!(
+                    "Windows v2 encode: could not reach the provisioner service at {PIPE_NAME} (last error {}); is the DecayFmtProvisionerTest service running?",
+                    last_error()
+                ),
+            });
+        }
+
+        // Exactly one request opcode is supported, matching the service.
+        let request = b"AllocateCounter\n";
+        if !write_all(handle, request) {
+            close(handle);
+            return Err(DecayError::NvCounter {
+                context:
+                    "Windows v2 encode: failed to send AllocateCounter to the provisioner pipe"
+                        .to_string(),
+            });
+        }
+
+        let response = read_response(handle);
+        close(handle);
+
+        match parse_ok(&response) {
+            Some(info) => Ok(info),
+            None => {
+                let text = String::from_utf8_lossy(&response);
+                let trimmed = text.trim();
+                Err(DecayError::NvCounter {
+                    context: format!(
+                        "Windows v2 encode: the provisioner returned an invalid or error response: {trimmed}"
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Parses the service's success line `OK nv_index=0x... c0=... nv_auth=0x...`.
+    fn parse_ok(response: &[u8]) -> Option<CounterInfo> {
+        let text = std::str::from_utf8(response).ok()?;
+        let rest = text.trim_start().strip_prefix("OK")?.trim_start();
+
+        let nv_key = "nv_index=0x";
+        let after_nv_key = &rest[rest.find(nv_key)? + nv_key.len()..];
+        let nv_end = after_nv_key
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after_nv_key.len());
+        let nv_index = u32::from_str_radix(&after_nv_key[..nv_end], 16).ok()?;
+
+        let after_nv = &after_nv_key[nv_end..];
+        let c0_key = "c0=";
+        let after_c0_key = &after_nv[after_nv.find(c0_key)? + c0_key.len()..];
+        let c0_end = after_c0_key
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after_c0_key.len());
+        let c0: u64 = after_c0_key[..c0_end].parse().ok()?;
+
+        // The service echoes the per-file 32-byte NV auth as 64 lowercase hex digits.
+        let after_c0 = &after_c0_key[c0_end..];
+        let auth_key = "nv_auth=0x";
+        let after_auth_key = &after_c0[after_c0.find(auth_key)? + auth_key.len()..];
+        let hex_end = after_auth_key
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(after_auth_key.len());
+        if hex_end != 64 {
+            return None;
+        }
+        let mut nv_auth = [0u8; 32];
+        for (i, byte) in nv_auth.iter_mut().enumerate() {
+            let two = after_auth_key
+                .get(i * 2..i * 2 + 2)
+                .expect("64 hex digits covers 32 bytes");
+            *byte = u8::from_str_radix(two, 16).ok()?;
+        }
+
+        Some(CounterInfo {
+            nv_index,
+            c0,
+            nv_auth,
+        })
+    }
+
+    /// Reads until the pipe closes or the response cap is reached.
+    fn read_response(handle: *mut c_void) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 128];
+        loop {
+            let mut bytes_read: u32 = 0;
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    chunk.as_mut_ptr(),
+                    chunk.len() as u32,
+                    &mut bytes_read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || bytes_read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..bytes_read as usize]);
+            if response.len() >= MAX_RESPONSE_BYTES || response.contains(&b'\n') {
+                break;
+            }
+        }
+        response
+    }
+
+    /// Writes the whole buffer to the pipe.
+    fn write_all(handle: *mut c_void, bytes: &[u8]) -> bool {
+        let mut written: u32 = 0;
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        ok != 0 && written == bytes.len() as u32
+    }
+
+    fn close(handle: *mut c_void) {
+        unsafe {
+            CloseHandle(handle);
+        }
+    }
+
+    /// Appends a NUL terminator so the wide buffer is usable as a `PCWSTR`.
+    fn to_wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn last_error() -> u32 {
+        unsafe { GetLastError() }
     }
 }

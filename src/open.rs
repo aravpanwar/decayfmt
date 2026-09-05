@@ -15,7 +15,7 @@ use crate::format::{parse_filename, FileType, Header, HeaderV2, ImageDimensions,
 use crate::tpm::{Tpm, TpmContext};
 use fs2::FileExt;
 use std::fs::OpenOptions;
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -108,8 +108,8 @@ fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
 /// unchanged v1 flow, in which the file is corrupted and persisted first and then
 /// displayed. Dimensions are present exactly for images, so their presence selects the
 /// display path. When `tcti` is `Some`, a v2 open connects to that TCTI (e.g.
-/// `swtpm:host=127.0.0.1,port=2321`) instead of the default `/dev/tpmrm0`; it is ignored for
-/// v1 files, which never touch the TPM.
+/// `swtpm:host=127.0.0.1,port=2321`) instead of the platform's default backend (Windows TBS);
+/// it is ignored for v1 files, which never touch the TPM.
 pub fn open_file(path: &Path, tcti: Option<&str>) -> Result<(), DecayError> {
     cleanup_old_view_files();
     // Route on the actual file format, not the filename: a v2 (DCF2) file is opened through
@@ -118,14 +118,19 @@ pub fn open_file(path: &Path, tcti: Option<&str>) -> Result<(), DecayError> {
     // v1 file from ever being mistaken for a v2 file on the basis of a bare extension.
     if file_is_v2(path)? {
         let mut tpm = TpmContext::connect_optional(tcti)?;
-        return open_v2_file(path, &mut tpm);
+        open_v2_file(path, &mut tpm)?;
+    } else {
+        let (header, file_bytes) = decay_in_place(path)?;
+        let payload = &file_bytes[HEADER_SIZE..];
+        match header.dimensions {
+            Some(dimensions) => display_image(payload, dimensions),
+            None => display_text(payload),
+        }?;
     }
-    let (header, file_bytes) = decay_in_place(path)?;
-    let payload = &file_bytes[HEADER_SIZE..];
-    match header.dimensions {
-        Some(dimensions) => display_image(payload, dimensions),
-        None => display_text(payload),
-    }
+    // A successful open has consumed its decay (v1 in place, v2 on the TPM) and shown the
+    // result in the system viewer; the CLI stays quiet apart from this single confirmation.
+    println!("File opened successfully.");
+    Ok(())
 }
 
 /// True when `path` is a v2 (DCF2) file, detected from its leading magic bytes.
@@ -151,9 +156,10 @@ fn file_is_v2(path: &Path) -> Result<bool, DecayError> {
 ///
 /// The index is `counter - c0`, the number of opens already consumed. It is bound to
 /// this file because a v2 file owns a freshly allocated per-file counter. A counter
-/// that has rolled back below `c0` is a rollback/inconsistent state and is refused;
-/// reaching `n_max` opens is refused as exhausted. Neither can be repaired.
-fn open_index_for(counter: u64, c0: u64, n_max: u32, nv_index: u32) -> Result<u64, DecayError> {
+/// that has rolled back below `c0` is a rollback/inconsistent state and is refused.
+/// A v2 file decays indefinitely: there is no exhaustion bound, and only the TPM's own
+/// `u64` counter overflow (which its increment reports) stops further opens.
+fn open_index_for(counter: u64, c0: u64, nv_index: u32) -> Result<u64, DecayError> {
     if counter < c0 {
         return Err(DecayError::NvCounter {
             context: format!(
@@ -161,15 +167,7 @@ fn open_index_for(counter: u64, c0: u64, n_max: u32, nv_index: u32) -> Result<u6
             ),
         });
     }
-    let open_index = counter - c0;
-    if open_index >= u64::from(n_max) {
-        return Err(DecayError::NvCounter {
-            context: format!(
-                "already exhausted: open_index {open_index} reaches n_max {n_max} at index {nv_index:#010x}"
-            ),
-        });
-    }
-    Ok(open_index)
+    Ok(counter - c0)
 }
 
 /// Runs the v2 open (parse, counter, decrypt, degrade) and returns the degraded plaintext
@@ -238,13 +236,13 @@ fn open_v2_processing(
     // exactly 8 bytes. A nonexistent index also fails here.
     tpm.validate_counter(header.nv_index)?;
 
-    // (6) read the current counter, then (7) fail closed on rollback/exhaustion.
-    let counter = tpm.read_counter(header.nv_index)?;
-    let open_index = open_index_for(counter, header.c0, header.n_max, header.nv_index)?;
+    // (6) read the current counter, then (7) fail closed on rollback below c0.
+    let counter = tpm.read_counter(header.nv_index, header.nv_auth)?;
+    let open_index = open_index_for(counter, header.c0, header.nv_index)?;
 
     // (9) consume the open by incrementing BEFORE unsealing or decrypting. If this fails,
     // no secret is touched; if it succeeds, the open is spent even if a later step fails.
-    tpm.increment_counter(header.nv_index)?;
+    tpm.increment_counter(header.nv_index, header.nv_auth)?;
 
     // (10)/(11) load the sealed object and unseal K.
     let mut key_bytes = tpm.unseal_content_key(&header.sealed_pub, &header.sealed_priv)?;
@@ -286,29 +284,17 @@ fn open_v2_file(path: &Path, tpm: &mut impl Tpm) -> Result<(), DecayError> {
     }
 }
 
-/// Displays a corrupted text payload.
+/// Shows a corrupted text payload in the system's default text editor.
 ///
 /// The payload may no longer be valid UTF-8 after corruption, so it is rendered
 /// lossily: invalid byte sequences become the Unicode replacement character rather
 /// than causing a failure. Corruption is allowed to break the text; display is not.
 ///
-/// The text is always written to stdout. When stdout is not a terminal, for example
-/// when decayfmt was launched from a file manager, that output goes nowhere, so the
-/// same text is also written to a temporary file and opened in the system's default
-/// text editor. This keeps the result visible without a console.
+/// The decayed text is written to a temporary file and opened in the system's default
+/// text editor rather than dumped to the terminal, so the CLI stays quiet while the
+/// result stays visible.
 fn display_text(payload: &[u8]) -> Result<(), DecayError> {
     let text = String::from_utf8_lossy(payload);
-    print!("{text}");
-    // Ensure the output ends on its own line so the shell prompt does not glue to the
-    // decayed text when the payload has no trailing newline of its own.
-    if !text.ends_with('\n') {
-        println!();
-    }
-
-    if std::io::stdout().is_terminal() {
-        return Ok(());
-    }
-
     let viewer_path = temporary_output_path("txt");
     std::fs::write(&viewer_path, text.as_bytes()).map_err(|error| DecayError::Io {
         context: format!("open: write display text '{}'", viewer_path.display()),
@@ -588,41 +574,28 @@ mod tests {
 
     #[test]
     fn open_index_first_open_is_zero() {
-        assert_eq!(
-            open_index_for(10, 10, 5, 0x0150_1234).expect("first open"),
-            0
-        );
+        assert_eq!(open_index_for(10, 10, 0x0150_1234).expect("first open"), 0);
     }
 
     #[test]
     fn open_index_counts_prior_opens() {
-        assert_eq!(
-            open_index_for(13, 10, 5, 0x0150_1234).expect("third open"),
-            3
-        );
+        assert_eq!(open_index_for(13, 10, 0x0150_1234).expect("third open"), 3);
     }
 
     #[test]
-    fn open_index_last_allowed_open_is_n_max_minus_one() {
+    fn open_index_tracks_many_opens_without_a_bound() {
+        // With no open limit a v2 file decays indefinitely: a counter far beyond c0 is still
+        // a valid open index (u64 max counter - c0), never an error.
         assert_eq!(
-            open_index_for(14, 10, 5, 0x0150_1234).expect("last valid open"),
-            4
+            open_index_for(u64::MAX - 2, 10, 0x0150_1234).expect("open far beyond any bound"),
+            u64::MAX - 2 - 10
         );
     }
 
     #[test]
     fn open_index_rejects_rollback() {
         assert!(matches!(
-            open_index_for(9, 10, 5, 0x0150_1234),
-            Err(DecayError::NvCounter { .. })
-        ));
-    }
-
-    #[test]
-    fn open_index_rejects_exhausted() {
-        // counter reaching c0 + n_max means the file is fully spent.
-        assert!(matches!(
-            open_index_for(15, 10, 5, 0x0150_1234),
+            open_index_for(9, 10, 0x0150_1234),
             Err(DecayError::NvCounter { .. })
         ));
     }
@@ -634,7 +607,7 @@ mod tests {
         fs::write(&input, b"hello, v2 world").expect("write v2 text source");
 
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("v2 text encode");
+        encode_v2(&input, &output, &mut fake).expect("v2 text encode");
 
         let (file_type, _dimensions, degraded) =
             open_v2_processing(&output, &mut fake).expect("v2 text open");
@@ -657,7 +630,7 @@ mod tests {
         source.save(&input).expect("save v2 image source");
 
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("v2 image encode");
+        encode_v2(&input, &output, &mut fake).expect("v2 image encode");
 
         let (file_type, dimensions, degraded) =
             open_v2_processing(&output, &mut fake).expect("v2 image open");
@@ -671,54 +644,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_default_n_max_is_ten() {
-        assert_eq!(crate::encode::DEFAULT_N_MAX, 10);
-
-        let input = unique_temp_path("v2_src.txt");
-        let output = unique_temp_path("v2_out.tdcy");
-        fs::write(&input, b"x").expect("write source");
-        let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, crate::encode::DEFAULT_N_MAX, &mut fake).expect("encode");
-
-        let bytes = fs::read(&output).expect("read encoded");
-        let (header, _consumed) = HeaderV2::read(&bytes).expect("parse v2 header");
-        assert_eq!(header.n_max, crate::encode::DEFAULT_N_MAX);
-
-        let _ = fs::remove_file(&input);
-        let _ = fs::remove_file(&output);
-    }
-
-    #[test]
-    fn v2_n_max_three_allows_three_opens_then_fails() {
-        let input = unique_temp_path("v2_src.txt");
-        let output = unique_temp_path("v2_out.tdcy");
-        fs::write(&input, b"abc").expect("write source");
-        let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 3, &mut fake).expect("encode n_max=3");
-
-        for expected in 0..3 {
-            open_v2_processing(&output, &mut fake)
-                .unwrap_or_else(|e| panic!("open {expected} should succeed: {e}"));
-        }
-        assert!(
-            matches!(
-                open_v2_processing(&output, &mut fake),
-                Err(DecayError::NvCounter { .. })
-            ),
-            "the 4th open must be refused as exhausted"
-        );
-
-        let _ = fs::remove_file(&input);
-        let _ = fs::remove_file(&output);
-    }
-
-    #[test]
     fn v2_file_is_byte_for_byte_unchanged_across_opens() {
         let input = unique_temp_path("v2_src.txt");
         let output = unique_temp_path("v2_out.tdcy");
         fs::write(&input, b"some payload").expect("write source");
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("encode");
+        encode_v2(&input, &output, &mut fake).expect("encode");
 
         let before = fs::read(&output).expect("read encoded file");
         for _ in 0..3 {
@@ -735,38 +666,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_file_is_unchanged_after_exhaustion() {
-        let input = unique_temp_path("v2_src.txt");
-        let output = unique_temp_path("v2_out.tdcy");
-        fs::write(&input, b"payload").expect("write source");
-        let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 3, &mut fake).expect("encode n_max=3");
-
-        let before = fs::read(&output).expect("read encoded file");
-        for _ in 0..3 {
-            open_v2_processing(&output, &mut fake).expect("open succeeds");
-        }
-        assert!(matches!(
-            open_v2_processing(&output, &mut fake),
-            Err(DecayError::NvCounter { .. })
-        ));
-        let after = fs::read(&output).expect("read after exhaustion");
-        assert_eq!(
-            before, after,
-            "the exhausted artifact must remain byte-for-byte unchanged"
-        );
-
-        let _ = fs::remove_file(&input);
-        let _ = fs::remove_file(&output);
-    }
-
-    #[test]
     fn v2_modified_ciphertext_is_rejected() {
         let input = unique_temp_path("v2_src.txt");
         let output = unique_temp_path("v2_out.tdcy");
         fs::write(&input, b"secret payload").expect("write source");
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("encode");
+        encode_v2(&input, &output, &mut fake).expect("encode");
 
         let mut bytes = fs::read(&output).expect("read encoded file");
         let (_, header_len) = HeaderV2::read(&bytes).expect("parse header");
@@ -792,11 +697,13 @@ mod tests {
         let output = unique_temp_path("v2_out.tdcy");
         fs::write(&input, b"payload").expect("write source");
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("encode");
+        encode_v2(&input, &output, &mut fake).expect("encode");
 
         let mut bytes = fs::read(&output).expect("read encoded file");
-        // payload_nonce is the last fixed field, at offset HEADER_V2_FIXED_LEN - 12 (31).
-        let nonce_offset = crate::format::HEADER_V2_FIXED_LEN - 12;
+        // payload_nonce is the fixed field immediately before the trailing 32-byte nv_auth,
+        // which itself ends at the fixed-region boundary, so the nonce starts at the end of
+        // the fixed region minus the 32 (nv_auth) and 12 (nonce) trailing bytes.
+        let nonce_offset = crate::format::HEADER_V2_FIXED_LEN - 32 - 12;
         bytes[nonce_offset] ^= 0xFF;
         fs::write(&output, &bytes).expect("write tampered header");
 
@@ -822,7 +729,7 @@ mod tests {
         source.save(&input).expect("save v2 image source");
 
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &image_file, 10, &mut fake).expect("v2 image encode");
+        encode_v2(&input, &image_file, &mut fake).expect("v2 image encode");
 
         let bytes = fs::read(&image_file).expect("read image v2 file");
         fs::write(&mismatched, &bytes).expect("write mismatched-name copy");
@@ -847,13 +754,20 @@ mod tests {
         header.nv_index
     }
 
+    /// Returns the `nv_auth` stored in a v2 file's header.
+    fn v2_nv_auth(path: &Path) -> [u8; 32] {
+        let bytes = fs::read(path).expect("read v2 file");
+        let (header, _consumed) = HeaderV2::read(&bytes).expect("parse v2 header");
+        header.nv_auth
+    }
+
     #[test]
     fn v2_counter_increments_before_unseal() {
         let input = unique_temp_path("v2_src.txt");
         let output = unique_temp_path("v2_out.tdcy");
         fs::write(&input, b"payload for ordering").expect("write source");
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("encode");
+        encode_v2(&input, &output, &mut fake).expect("encode");
         fake.call_log.clear();
 
         fake.fail_unseal = true;
@@ -867,7 +781,8 @@ mod tests {
             vec!["validate", "read", "increment", "unseal"]
         );
         assert_eq!(
-            fake.read_counter(v2_nv_index(&output)).unwrap(),
+            fake.read_counter(v2_nv_index(&output), v2_nv_auth(&output))
+                .unwrap(),
             1,
             "counter must advance by exactly one despite the unseal failure"
         );
@@ -882,7 +797,7 @@ mod tests {
         let output = unique_temp_path("v2_out.tdcy");
         fs::write(&input, b"0123456789abcdef").expect("write source");
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("encode");
+        encode_v2(&input, &output, &mut fake).expect("encode");
         fake.call_log.clear();
 
         // First open fails after increment (during unseal), consuming one access.
@@ -895,7 +810,11 @@ mod tests {
             fake.call_log,
             vec!["validate", "read", "increment", "unseal"]
         );
-        assert_eq!(fake.read_counter(v2_nv_index(&output)).unwrap(), 1);
+        assert_eq!(
+            fake.read_counter(v2_nv_index(&output), v2_nv_auth(&output))
+                .unwrap(),
+            1
+        );
 
         // Disable the failure; the next open is index 1 (counter already 1), not index 0.
         fake.fail_unseal = false;
@@ -907,7 +826,11 @@ mod tests {
             fake.call_log,
             vec!["validate", "read", "increment", "unseal"]
         );
-        assert_eq!(fake.read_counter(v2_nv_index(&output)).unwrap(), 2);
+        assert_eq!(
+            fake.read_counter(v2_nv_index(&output), v2_nv_auth(&output))
+                .unwrap(),
+            2
+        );
 
         let _ = fs::remove_file(&input);
         let _ = fs::remove_file(&output);
@@ -919,7 +842,7 @@ mod tests {
         let output = unique_temp_path("v2_out.tdcy");
         fs::write(&input, b"secret").expect("write source");
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("encode");
+        encode_v2(&input, &output, &mut fake).expect("encode");
         fake.call_log.clear();
 
         fake.fail_increment = true;
@@ -931,36 +854,11 @@ mod tests {
         // Unseal was never reached; increment was attempted but the counter did not advance.
         assert_eq!(fake.call_log, vec!["validate", "read", "increment"]);
         assert_eq!(
-            fake.read_counter(v2_nv_index(&output)).unwrap(),
+            fake.read_counter(v2_nv_index(&output), v2_nv_auth(&output))
+                .unwrap(),
             0,
             "counter must not advance when increment fails"
         );
-
-        let _ = fs::remove_file(&input);
-        let _ = fs::remove_file(&output);
-    }
-
-    #[test]
-    fn v2_exhausted_file_does_not_unseal() {
-        let input = unique_temp_path("v2_src.txt");
-        let output = unique_temp_path("v2_out.tdcy");
-        fs::write(&input, b"payload").expect("write source");
-        let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 3, &mut fake).expect("encode n_max=3");
-
-        for _ in 0..3 {
-            open_v2_processing(&output, &mut fake).expect("open succeeds");
-        }
-        fake.call_log.clear();
-        fake.fail_unseal = true;
-
-        let result = open_v2_processing(&output, &mut fake);
-        assert!(
-            matches!(result, Err(DecayError::NvCounter { .. })),
-            "exhaustion must win over a configured unseal failure"
-        );
-        assert_eq!(fake.call_log, vec!["validate", "read"]);
-        assert_eq!(fake.read_counter(v2_nv_index(&output)).unwrap(), 3);
 
         let _ = fs::remove_file(&input);
         let _ = fs::remove_file(&output);
@@ -972,7 +870,7 @@ mod tests {
         let output = unique_temp_path("v2_out.tdcy");
         fs::write(&input, b"payload").expect("write source");
         let mut fake = FakeTpm::new();
-        encode_v2(&input, &output, 10, &mut fake).expect("encode");
+        encode_v2(&input, &output, &mut fake).expect("encode");
         fake.call_log.clear();
 
         fake.fail_validate = true;
@@ -981,7 +879,11 @@ mod tests {
             Err(DecayError::NvCounter { .. })
         ));
         assert_eq!(fake.call_log, vec!["validate"]);
-        assert_eq!(fake.read_counter(v2_nv_index(&output)).unwrap(), 0);
+        assert_eq!(
+            fake.read_counter(v2_nv_index(&output), v2_nv_auth(&output))
+                .unwrap(),
+            0
+        );
         fake.call_log.clear();
 
         fake.fail_validate = false;
@@ -993,57 +895,16 @@ mod tests {
         assert_eq!(fake.call_log, vec!["validate", "read"]);
         // Disable the read failure so we can inspect the counter (it must be unchanged).
         fake.fail_read = false;
-        assert_eq!(fake.read_counter(v2_nv_index(&output)).unwrap(), 0);
-
-        let _ = fs::remove_file(&input);
-        let _ = fs::remove_file(&output);
-    }
-
-    #[test]
-    fn v2_real_swtpm_lifecycle_expires_after_n_max() {
-        // Connect to the real software TPM. This FAILS (does not skip) if swtpm is unavailable.
-        let conf: TctiNameConf = "swtpm:host=127.0.0.1,port=2321"
-            .parse()
-            .expect("swtpm TCTI name must parse");
-        let mut tpm = TpmContext::connect_with_tcti(conf)
-            .expect("swtpm must be running on 127.0.0.1:2321 for the real v2 lifecycle test");
-
-        let input = unique_temp_path("swtpm_src.txt");
-        let output = unique_temp_path("swtpm_out.tdcy");
-        fs::write(&input, b"real swtpm lifecycle payload").expect("write source");
-
-        // Encode with n_max = 3; encode itself consumes no access.
-        encode_v2(&input, &output, 3, &mut tpm).expect("v2 encode against the software TPM");
-
-        let before = fs::read(&output).expect("read encoded v2 file");
-
-        // Opens 0, 1 and 2 must succeed; the 4th open (index 3) must be exhausted.
-        for open_index in 0..3u32 {
-            let (file_type, _dims, degraded) = open_v2_processing(&output, &mut tpm)
-                .unwrap_or_else(|e| panic!("v2 open {open_index} should succeed: {e}"));
-            assert_eq!(file_type, FileType::Text);
-            if open_index == 0 {
-                // open_index 0 degrades nothing, so the plaintext is pristine.
-                assert_eq!(degraded, b"real swtpm lifecycle payload".to_vec());
-            }
-        }
-        assert!(
-            matches!(
-                open_v2_processing(&output, &mut tpm),
-                Err(DecayError::NvCounter { .. })
-            ),
-            "the 4th open must be refused as exhausted"
-        );
-
-        let after = fs::read(&output).expect("read v2 file after opens");
         assert_eq!(
-            before, after,
-            "the v2 artifact must be byte-for-byte unchanged across opens and exhaustion"
+            fake.read_counter(v2_nv_index(&output), v2_nv_auth(&output))
+                .unwrap(),
+            0
         );
 
         let _ = fs::remove_file(&input);
         let _ = fs::remove_file(&output);
     }
+
     /// Reserves a free loopback TCP port by binding an ephemeral socket. The listener is dropped
     /// immediately, so there is a tiny race before swtpm binds it.
     fn free_tcp_port() -> u16 {
@@ -1156,7 +1017,7 @@ mod tests {
         let input = unique_temp_path("swtpm_persist_src.txt");
         let output = unique_temp_path("swtpm_persist_out.tdcy");
         fs::write(&input, &payload).expect("write source");
-        encode_v2(&input, &output, 3, &mut tpm).expect("v2 encode (before restart)");
+        encode_v2(&input, &output, &mut tpm).expect("v2 encode (before restart)");
 
         let nv_index = v2_nv_index(&output);
         let before = fs::read(&output).expect("read encoded v2 file");
@@ -1167,7 +1028,7 @@ mod tests {
         assert_eq!(ft0, FileType::Text, "first open is a text file");
         assert_eq!(p0, payload, "open 0 is pristine (index 0 degrades nothing)");
         assert_eq!(
-            tpm.read_counter(nv_index).unwrap(),
+            tpm.read_counter(nv_index, v2_nv_auth(&output)).unwrap(),
             1,
             "counter is 1 after the first open"
         );
@@ -1179,7 +1040,7 @@ mod tests {
         // Reconnect: the sealed object and NV counter must both still be valid after the restart.
         let mut tpm = connect_swtpm(server_port);
         assert_eq!(
-            tpm.read_counter(nv_index).unwrap(),
+            tpm.read_counter(nv_index, v2_nv_auth(&output)).unwrap(),
             1,
             "the NV counter must survive the swtpm restart"
         );
@@ -1194,7 +1055,7 @@ mod tests {
         );
         assert_ne!(p1, p0, "the two opens must yield different plaintexts");
         assert_eq!(
-            tpm.read_counter(nv_index).unwrap(),
+            tpm.read_counter(nv_index, v2_nv_auth(&output)).unwrap(),
             2,
             "counter is 2 after the second open"
         );
@@ -1254,6 +1115,7 @@ mod tests {
             Ok(CounterInfo {
                 nv_index: self.nv_index,
                 c0: 0,
+                nv_auth: [0u8; 32],
             })
         }
 
@@ -1261,13 +1123,17 @@ mod tests {
             Ok(())
         }
 
-        fn read_counter(&mut self, _nv_index: u32) -> Result<u64, DecayError> {
+        fn read_counter(&mut self, _nv_index: u32, _nv_auth: [u8; 32]) -> Result<u64, DecayError> {
             let value = self.counter.load(Ordering::SeqCst);
             self.reads.lock().unwrap().push(value);
             Ok(value)
         }
 
-        fn increment_counter(&mut self, _nv_index: u32) -> Result<(), DecayError> {
+        fn increment_counter(
+            &mut self,
+            _nv_index: u32,
+            _nv_auth: [u8; 32],
+        ) -> Result<(), DecayError> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1289,7 +1155,7 @@ mod tests {
         let output = unique_temp_path("v2_concurrent_out.tdcy");
         fs::write(&input, b"payload for concurrent open indexing").expect("write source");
         let mut encoder = CountingTpm::new();
-        encode_v2(&input, &output, OPENS as u32, &mut encoder).expect("v2 encode");
+        encode_v2(&input, &output, &mut encoder).expect("v2 encode");
 
         // Fire OPENS concurrent opens of the same .tdcy, all released at once. Because
         // open_v2_processing locks the file for the read-counter -> increment-counter critical

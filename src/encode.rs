@@ -86,9 +86,6 @@ pub fn encode_file(input: &Path, output: &Path) -> Result<(), DecayError> {
     write_decayfmt(output, header, &payload)
 }
 
-/// The default `n_max` for a v2 file when `--max-opens` is not supplied.
-pub const DEFAULT_N_MAX: u32 = 10;
-
 /// How an output filename selects the encoding version and payload type.
 ///
 /// A v2 output name ends in a bare `.idcy` (image) or `.tdcy` (text) extension with no
@@ -134,19 +131,13 @@ fn classify_output(path: &Path) -> Result<EncodeKind, DecayError> {
 ///
 /// This is the entry point the CLI calls. The v2, TPM-bound, encrypted encode is **opt-in**:
 /// it runs only when `v2` is `true` and the output name ends in a bare `.idcy` / `.tdcy`
-/// (no decay suffix); it honours `max_opens` (which requires `v2`). Without `v2` the default
-/// v1 encode runs unchanged on a `.idcy<x>` / `.tdcy<x>` name and is left byte-for-byte
-/// identical to before. A bare v2 output name without `-v2`, or `max_opens` without `-v2`, is
-/// rejected rather than silently falling back or ignoring the option. When `tcti` is `Some`, a
-/// v2 encode connects to that TCTI (e.g. `swtpm:host=127.0.0.1,port=2321`) instead of the
-/// default `/dev/tpmrm0`; it is ignored for v1 names, which never touch the TPM.
-pub fn encode(
-    input: &Path,
-    output: &Path,
-    max_opens: Option<u32>,
-    v2: bool,
-    tcti: Option<&str>,
-) -> Result<(), DecayError> {
+/// (no decay suffix). Without `v2` the default v1 encode runs unchanged on a `.idcy<x>` /
+/// `.tdcy<x>` name and is left byte-for-byte identical to before. A bare v2 output name
+/// without `-v2` is rejected rather than silently falling back or ignoring the option. When
+/// `tcti` is `Some`, a v2 encode connects to that TCTI (e.g. `swtpm:host=127.0.0.1,port=2321`)
+/// instead of the platform's default backend (Windows TBS); it is ignored for v1 names, which
+/// never touch the TPM.
+pub fn encode(input: &Path, output: &Path, v2: bool, tcti: Option<&str>) -> Result<(), DecayError> {
     match classify_output(output)? {
         EncodeKind::V2 { .. } => {
             if !v2 {
@@ -155,20 +146,13 @@ pub fn encode(
                         .to_string(),
                 });
             }
-            let n_max = max_opens.unwrap_or(DEFAULT_N_MAX);
             let mut tpm = TpmContext::connect_optional(tcti)?;
-            encode_v2(input, output, n_max, &mut tpm)
+            encode_v2(input, output, &mut tpm)
         }
         EncodeKind::V1 { .. } => {
             if v2 {
                 return Err(DecayError::InvalidArgument {
                     context: "v2 requires an output name ending in a bare .idcy or .tdcy (no decay suffix)"
-                        .to_string(),
-                });
-            }
-            if max_opens.is_some() {
-                return Err(DecayError::InvalidArgument {
-                    context: "max-opens requires -v2 (it applies only to v2, TPM-bound output)"
                         .to_string(),
                 });
             }
@@ -188,18 +172,7 @@ pub fn encode(
 /// before the header so it is a fixed, authenticated header field. No corruption, no
 /// re-encryption, and no counter increment happens at encode time; the counter is only ever
 /// advanced at open time.
-pub fn encode_v2(
-    input: &Path,
-    output: &Path,
-    n_max: u32,
-    tpm: &mut impl Tpm,
-) -> Result<(), DecayError> {
-    if n_max == 0 {
-        return Err(DecayError::InvalidArgument {
-            context: "max-opens must be greater than zero".to_string(),
-        });
-    }
-
+pub fn encode_v2(input: &Path, output: &Path, tpm: &mut impl Tpm) -> Result<(), DecayError> {
     let file_type = match classify_output(output)? {
         EncodeKind::V2 { file_type } => file_type,
         EncodeKind::V1 { .. } => {
@@ -245,10 +218,10 @@ pub fn encode_v2(
         height,
         counter.nv_index,
         counter.c0,
-        n_max,
         payload_nonce_arr,
         sealed_pub,
         sealed_priv,
+        counter.nv_auth,
     );
 
     // (g) serialized header bytes are the AAD, so (h) encrypt only after they exist.
@@ -374,8 +347,8 @@ mod tests {
         let _ = fs::remove_file(&output);
     }
 
-    // The v2 encode is opt-in: without -v2 the default v1 path must be unchanged, a bare
-    // v2 name requires -v2, and --max-opens requires -v2. These are the CLI-facing contract.
+    // The v2 encode is opt-in: without -v2 the default v1 path must be unchanged, and a bare
+    // v2 name requires -v2. These are the CLI-facing contract.
 
     #[test]
     fn v1_encode_is_default_without_v2_flag() {
@@ -383,7 +356,7 @@ mod tests {
         let output = unique_temp_path("default_note.tdcy5");
         fs::write(&input, b"default v1 payload").expect("write source");
 
-        encode(&input, &output, None, false, None).expect("default encode must be v1");
+        encode(&input, &output, false, None).expect("default encode must be v1");
 
         let written = fs::read(&output).expect("read encoded file");
         assert_eq!(
@@ -408,25 +381,10 @@ mod tests {
         let output = unique_temp_path("bare_note.tdcy");
         fs::write(&input, b"payload").expect("write source");
 
-        let result = encode(&input, &output, None, false, None);
+        let result = encode(&input, &output, false, None);
         assert!(
             matches!(result, Err(DecayError::InvalidArgument { .. })),
             "a bare v2 name without -v2 must be rejected, got {result:?}"
-        );
-
-        let _ = fs::remove_file(&input);
-    }
-
-    #[test]
-    fn max_opens_requires_v2() {
-        let input = unique_temp_path("max_src.txt");
-        let output = unique_temp_path("max_note.tdcy5");
-        fs::write(&input, b"payload").expect("write source");
-
-        let result = encode(&input, &output, Some(5), false, None);
-        assert!(
-            matches!(result, Err(DecayError::InvalidArgument { .. })),
-            "--max-opens without -v2 must be rejected, got {result:?}"
         );
 
         let _ = fs::remove_file(&input);
@@ -438,7 +396,7 @@ mod tests {
         let output = unique_temp_path("v2_note.tdcy5");
         fs::write(&input, b"payload").expect("write source");
 
-        let result = encode(&input, &output, None, true, None);
+        let result = encode(&input, &output, true, None);
         assert!(
             matches!(result, Err(DecayError::InvalidArgument { .. })),
             "-v2 with a v1-style (decay-suffixed) name must be rejected, got {result:?}"
