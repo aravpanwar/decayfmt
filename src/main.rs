@@ -18,6 +18,13 @@ use std::process::ExitCode;
     about = "A file format where opening a file corrupts it."
 )]
 struct Cli {
+    /// Optional TSS2 TCTI configuration to connect to, for example
+    /// `swtpm:host=127.0.0.1,port=2321`. When omitted the platform's default TPM backend is
+    /// used (Windows TBS; `/dev/tpmrm0` elsewhere), so it can normally be left out. Only
+    /// affects v2 (bare `.idcy`/`.tdcy`) files.
+    #[arg(long, global = true)]
+    tcti: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -30,10 +37,17 @@ enum Command {
         /// Path to the source image or text file to encode.
         #[arg(long)]
         input: PathBuf,
-        /// Path to write the decayfmt file to, ending in .idcy<x> or .tdcy<x>. The
-        /// instability value x is taken from this name; higher x decays faster.
+        /// Path to write the decayfmt file to. Ending in .idcy<x> or .tdcy<x> produces a v1
+        /// file (the default); the instability value x is taken from the v1 name and higher x
+        /// decays faster. A bare .idcy/.tdcy (no decay suffix) name produces the v2, TPM-bound
+        /// file and requires -v2.
         #[arg(long)]
         output: PathBuf,
+        /// Opt into the TPM-backed v2 format: an encrypted, hardware-bound file whose decay
+        /// is enforced by a TPM monotonic counter. Only v2 output names (bare .idcy/.tdcy)
+        /// may be used with it.
+        #[arg(long)]
+        v2: bool,
     },
     /// Open a decayfmt file: corrupt it in place on disk, then display it.
     Open {
@@ -47,14 +61,16 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Encode { input, output } => decayfmt::encode::encode_file(&input, &output),
-        Command::Open { file } => decayfmt::open::open_file(&file),
+        Command::Encode { input, output, v2 } => {
+            decayfmt::encode::encode(&input, &output, v2, cli.tcti.as_deref())
+        }
+        Command::Open { file } => decayfmt::open::open_file(&file, cli.tcti.as_deref()),
     };
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{}", error);
+            eprintln!("{error}");
             ExitCode::FAILURE
         }
     }

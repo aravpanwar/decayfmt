@@ -4,12 +4,9 @@
 //! logic here; the caller is responsible for reading the payload, calling into
 //! this module, and writing the result back. The invariant this module upholds is
 //! that corruption is always stochastic and always drawn from a cryptographically
-//! secure generator seeded from operating system entropy, never from a fixed seed.
-//! It is never deterministic, because a reproducible corruption sequence could be
-//! replayed to reconstruct the original and undo the decay. Large payloads are
-//! processed in parallel regions, each of which seeds its own OS-entropy
-//! generator; the per-byte decisions stay independent across region boundaries,
-//! so the aggregate remains undirected noise.
+//! secure generator seeded from operating system entropy, never from a fixed seed. It
+//! is never deterministic, because a reproducible corruption sequence could be replayed
+//! to reconstruct the original and undo the decay.
 
 // `chunks_exact_to_as_chunks` (a newer clippy lint) suggests `slice::as_chunks`, which is
 // stable only from Rust 1.88; we keep `chunks_exact` to preserve a low minimum supported
@@ -18,7 +15,7 @@
 #![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 
 use crate::format::FileType;
-use rand::{Rng, RngCore};
+use rand::Rng;
 
 /// The divisor in the corruption probability curve p = 1 - exp(-x / DECAY_SCALE).
 ///
@@ -43,26 +40,6 @@ const PRINTABLE_ASCII_LOW: u8 = 0x20;
 /// Highest printable ASCII byte used as a text corruption replacement (tilde).
 const PRINTABLE_ASCII_HIGH: u8 = 0x7E;
 
-/// Number of printable ASCII bytes in the text replacement range.
-const PRINTABLE_ASCII_COUNT: u16 = (PRINTABLE_ASCII_HIGH - PRINTABLE_ASCII_LOW) as u16 + 1;
-
-/// Largest draw accepted for the cheap rejection-free text replacement mapping:
-/// 689 full copies of 0..95 fit in [0, 65455), so a draw below this value maps to
-/// a uniformly distributed replacement with no rejection. Draws at or above it
-/// (0.124% of the range) fall back to a direct uniform draw.
-const TEXT_REPLACEMENT_ACCEPT_MAX: u16 = PRINTABLE_ASCII_COUNT * 689;
-
-/// Bytes of payload processed per pool fill. Two u16 draws per byte covers the
-/// worst case (every byte corrupted), so one fill covers a chunk of this size.
-const CHUNK_BYTES: usize = 64 * 1024;
-
-/// Payload length below which the parallel path is not worth the coordination.
-const PAR_MIN_BYTES: usize = 1024 * 1024;
-
-/// Size of the contiguous region handed to each parallel task. Kept a multiple
-/// of 4 so image regions start on pixel boundaries and alpha stays at index 3.
-const REGION_BYTES: usize = 4 * 1024 * 1024;
-
 /// Derives the per-byte corruption probability from the instability value x.
 ///
 /// p = 1 - exp(-x / DECAY_SCALE). The exponential form makes p climb smoothly from
@@ -72,146 +49,57 @@ fn corruption_probability(x: f64) -> f64 {
     1.0 - (-x / DECAY_SCALE).exp()
 }
 
-/// Converts a probability to the 16-bit integer threshold used by the bulk
-/// corruption loops.
-///
-/// A byte is corrupted when its random draw, uniform over [0, 65536), is below
-/// the threshold, giving an effective per-byte probability of t / 65536. That
-/// deviates from the continuous p by at most 1 / 65536 (about 1.5e-5), which is
-/// far below what any filename x can distinguish. The cast saturates: p = 1
-/// becomes 65535, so even a saturated threshold leaves a 1-in-65536 byte
-/// untouched rather than promising exact certainty.
-fn probability_threshold(x: f64) -> u16 {
-    (corruption_probability(x) * 65536.0) as u16
-}
-
 /// Corrupts a payload in place according to its file type and instability value x.
 ///
-/// Mutates the slice directly. Randomness is drawn in bulk from `rand::thread_rng`
-/// generators, cryptographically secure and seeded from operating system entropy;
-/// large payloads are split into parallel regions that each seed their own
-/// generator, so two opens of the same bytes produce different results. Upholds
+/// Mutates the slice directly. Randomness comes from `rand::thread_rng`, a
+/// cryptographically secure generator seeded from operating system entropy, drawn
+/// fresh per call, so two opens of the same bytes produce different results. Upholds
 /// the invariant that corruption is never driven by a fixed, replayable seed.
 pub fn corrupt(payload: &mut [u8], file_type: FileType, x: f64) {
-    let threshold = probability_threshold(x);
-    corrupt_payload(payload, file_type, threshold);
-}
-
-/// Corrupts the eligible portion of `payload` using the given integer threshold.
-///
-/// Text corrupts every byte; image corrupts only the R, G, and B channels of
-/// whole pixels, so the payload is truncated to a whole number of pixels and any
-/// trailing bytes are left untouched.
-fn corrupt_payload(payload: &mut [u8], file_type: FileType, threshold: u16) {
-    let eligible_len = match file_type {
-        FileType::Text => payload.len(),
-        FileType::Image => payload.len() - payload.len() % RGBA_BYTES_PER_PIXEL,
-    };
-    if eligible_len == 0 {
-        return;
-    }
-    let eligible = &mut payload[..eligible_len];
-
-    let parallel = eligible_len >= PAR_MIN_BYTES
-        && std::thread::available_parallelism()
-            .map(|cores| cores.get() > 1)
-            .unwrap_or(false);
-
-    if parallel {
-        use rayon::prelude::*;
-        // Disjoint contiguous regions, each a multiple of 4 so image pixels
-        // never straddle a boundary. Every region seeds its own OS-entropy
-        // generator, keeping per-byte decisions independent across boundaries.
-        eligible.par_chunks_mut(REGION_BYTES).for_each(|region| {
-            let mut rng = rand::thread_rng();
-            region_work(region, file_type, threshold, &mut rng);
-        });
-    } else {
-        let mut rng = rand::thread_rng();
-        region_work(eligible, file_type, threshold, &mut rng);
+    let probability = corruption_probability(x);
+    let mut rng = rand::thread_rng();
+    match file_type {
+        FileType::Image => corrupt_image(payload, probability, &mut rng),
+        FileType::Text => corrupt_text(payload, probability, &mut rng),
     }
 }
 
-/// Corrupts a whole region sequentially, in sub-blocks of `CHUNK_BYTES`.
-///
-/// Per sub-block, one bulk fill of a u16 pool supplies all threshold and
-/// replacement draws for that block, so per-byte distribution calls are replaced
-/// by one stream fill plus integer compares. The pool is sized for the worst
-/// case of two draws per byte and is reused across sub-blocks, keeping transient
-/// memory bounded to the pool (256 KiB) per region.
-fn region_work<R: RngCore>(
-    mut region: &mut [u8],
-    file_type: FileType,
-    threshold: u16,
-    rng: &mut R,
-) {
-    let mut pool = vec![0u16; CHUNK_BYTES * 2];
-    while !region.is_empty() {
-        let chunk_len = region.len().min(CHUNK_BYTES);
-        let (chunk, rest) = region.split_at_mut(chunk_len);
-        region = rest;
-        rng.fill(&mut pool[..chunk_len * 2]);
-        match file_type {
-            FileType::Text => corrupt_text_chunk(chunk, threshold, &pool, rng),
-            FileType::Image => corrupt_image_chunk(chunk, threshold, &pool),
-        }
-    }
-}
-
-/// Corrupts the R, G, and B channels of an RGBA payload chunk, each
-/// independently, with probability threshold / 65536. Upholds the invariant that
-/// the alpha channel is never touched: transparency is preserved so corruption
-/// shows as color noise rather than transparency holes. The low byte of a fresh
-/// u16 draw is the replacement, uniform over 0..=255.
-///
-/// Draws are consumed from `pool` strictly left to right, one per channel for
-/// the decision and one more only when the channel is corrupted; leftover pool
-/// entries are discarded, never reused.
-fn corrupt_image_chunk(chunk: &mut [u8], threshold: u16, pool: &[u16]) {
-    let mut draw = 0;
-    for pixel in chunk.chunks_exact_mut(RGBA_BYTES_PER_PIXEL) {
-        for channel in pixel.iter_mut().take(ALPHA_INDEX) {
-            if pool[draw] < threshold {
-                draw += 1;
-                *channel = pool[draw] as u8;
+/// Corrupts the R, G, and B channels of an RGBA payload, each independently, with
+/// the given probability. Upholds the invariant that the alpha channel is never
+/// touched: transparency is preserved so corruption shows as color noise rather
+/// than transparency holes. Any trailing bytes that do not form a whole pixel are
+/// left untouched, since a well-formed RGBA payload is a whole number of pixels.
+fn corrupt_image<R: Rng>(payload: &mut [u8], probability: f64, rng: &mut R) {
+    for pixel in payload.chunks_exact_mut(RGBA_BYTES_PER_PIXEL) {
+        for (index, channel) in pixel.iter_mut().enumerate() {
+            if index == ALPHA_INDEX {
+                continue;
             }
-            draw += 1;
+            if rng.gen::<f64>() < probability {
+                *channel = rng.gen::<u8>();
+            }
         }
     }
 }
 
-/// Corrupts a text payload chunk by replacing bytes, each independently with
-/// probability threshold / 65536, with a uniformly random printable ASCII byte
-/// (0x20 to 0x7E).
+/// Corrupts a text payload by replacing bytes, each independently with the given
+/// probability, with a uniformly random printable ASCII byte (0x20 to 0x7E).
 ///
-/// Operates on bytes, not Unicode codepoints, so at high x this can split or
-/// break multi-byte UTF-8 sequences. That is intended: the display layer is
-/// responsible for substituting the Unicode replacement character for whatever
-/// is no longer valid. This module only damages bytes.
-fn corrupt_text_chunk<R: RngCore>(chunk: &mut [u8], threshold: u16, pool: &[u16], rng: &mut R) {
-    let mut draw = 0;
-    for byte in chunk.iter_mut() {
-        if pool[draw] < threshold {
-            draw += 1;
-            let r = pool[draw];
-            // 689 full copies of 0..94 fit in [0, 65455), so this maps a draw
-            // to an exactly uniform replacement without rejection. The rare
-            // high draw falls back to a direct uniform draw from the stream.
-            *byte = if r < TEXT_REPLACEMENT_ACCEPT_MAX {
-                PRINTABLE_ASCII_LOW + (r % PRINTABLE_ASCII_COUNT) as u8
-            } else {
-                rng.gen_range(PRINTABLE_ASCII_LOW..=PRINTABLE_ASCII_HIGH)
-            };
+/// Operates on bytes, not Unicode codepoints, so at high x this can split or break
+/// multi-byte UTF-8 sequences. That is intended: the display layer is responsible
+/// for substituting the Unicode replacement character for whatever is no longer
+/// valid. This module only damages bytes.
+fn corrupt_text<R: Rng>(payload: &mut [u8], probability: f64, rng: &mut R) {
+    for byte in payload.iter_mut() {
+        if rng.gen::<f64>() < probability {
+            *byte = rng.gen_range(PRINTABLE_ASCII_LOW..=PRINTABLE_ASCII_HIGH);
         }
-        draw += 1;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
 
     /// Tolerance for comparing an observed corruption fraction against its expected
     /// probability, as specified by the milestone.
@@ -234,17 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn threshold_quantization_stays_within_one_65536th() {
-        // The integer threshold deviates from the continuous probability by at
-        // most 1 / 65536 for every x the format can express.
-        for x in [0.5, 1.0, 2.0, 5.0, 10.0, 25.0] {
-            let p = corruption_probability(x);
-            let t = probability_threshold(x);
-            assert!((t as f64 / 65536.0 - p).abs() <= 1.0 / 65536.0 + 1e-12);
-        }
-    }
-
-    #[test]
     fn text_corruption_fraction_at_x1_is_near_expected() {
         // An all-zero payload makes measurement exact: a corruption replacement is
         // always printable ASCII (never zero), so every selected byte visibly
@@ -255,9 +132,7 @@ mod tests {
         let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
         assert!(
             (fraction - 0.095).abs() < FRACTION_TOLERANCE,
-            "x=1 text fraction {} not within {} of 0.095",
-            fraction,
-            FRACTION_TOLERANCE
+            "x=1 text fraction {fraction} not within {FRACTION_TOLERANCE} of 0.095",
         );
     }
 
@@ -269,9 +144,7 @@ mod tests {
         let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
         assert!(
             (fraction - 0.632).abs() < FRACTION_TOLERANCE,
-            "x=10 text fraction {} not within {} of 0.632",
-            fraction,
-            FRACTION_TOLERANCE
+            "x=10 text fraction {fraction} not within {FRACTION_TOLERANCE} of 0.632",
         );
     }
 
@@ -301,9 +174,7 @@ mod tests {
 
         assert!(
             high_total > low_total,
-            "higher x mean corruption ({}) was not greater than lower x ({})",
-            high_total,
-            low_total
+            "higher x mean corruption ({high_total}) was not greater than lower x ({low_total})",
         );
     }
 
@@ -355,155 +226,7 @@ mod tests {
         let fraction = changed as f64 / rgb_channels as f64;
         assert!(
             (fraction - 0.632).abs() < FRACTION_TOLERANCE,
-            "x=10 image RGB fraction {} not within {} of 0.632",
-            fraction,
-            FRACTION_TOLERANCE
-        );
-    }
-
-    /// All payloads below the parallel threshold exercise the serial path; the
-    /// following large-payload tests push corruption onto the rayon path and
-    /// across region boundaries.
-
-    #[test]
-    fn image_alpha_never_modified_large_parallel() {
-        // An 8 MiB RGBA payload with an alpha sentinel forces the parallel path
-        // (>= PAR_MIN_BYTES) and spans multiple 4 MiB regions, so alpha survival
-        // is checked across region boundaries.
-        const PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-        const ALPHA_SENTINEL: u8 = 0xCD;
-        let mut payload = Vec::with_capacity(PAYLOAD_BYTES);
-        while payload.len() < PAYLOAD_BYTES {
-            payload.extend_from_slice(&[0x00, 0x00, 0x00, ALPHA_SENTINEL]);
-        }
-
-        corrupt(&mut payload, FileType::Image, 10.0);
-
-        assert_eq!(
-            payload.len(),
-            PAYLOAD_BYTES,
-            "corruption changed the length"
-        );
-        for pixel in payload.chunks_exact(RGBA_BYTES_PER_PIXEL) {
-            assert_eq!(
-                pixel[ALPHA_INDEX], ALPHA_SENTINEL,
-                "alpha channel was modified by parallel corruption"
-            );
-        }
-    }
-
-    #[test]
-    fn large_text_fraction_near_expected() {
-        // 8 MiB all-zero payload spans multiple parallel regions; the measured
-        // fraction must still match the continuous probability within tolerance.
-        for (x, expected) in [(1.0, 0.095), (10.0, 0.632)] {
-            let original = vec![0u8; 8 * 1024 * 1024];
-            let mut payload = original.clone();
-            corrupt(&mut payload, FileType::Text, x);
-            let fraction = changed_count(&original, &payload) as f64 / original.len() as f64;
-            assert!(
-                (fraction - expected).abs() < FRACTION_TOLERANCE,
-                "x={} text fraction {} not within {} of {}",
-                x,
-                fraction,
-                FRACTION_TOLERANCE,
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn large_image_rgb_fraction_near_expected() {
-        // 8 MiB RGBA payload forces the parallel path; only R, G, B channels
-        // count, and the 1-in-256 chance a replacement lands on zero keeps the
-        // observed fraction within tolerance.
-        let payload = vec![0u8; 8 * 1024 * 1024];
-        for (x, expected) in [(1.0, 0.095), (10.0, 0.632)] {
-            let mut corrupted = payload.clone();
-            corrupt(&mut corrupted, FileType::Image, x);
-
-            let mut changed = 0usize;
-            for pixel in corrupted.chunks_exact(RGBA_BYTES_PER_PIXEL) {
-                for channel in pixel.iter().take(ALPHA_INDEX) {
-                    if *channel != 0 {
-                        changed += 1;
-                    }
-                }
-            }
-            let rgb_channels = corrupted.len() / RGBA_BYTES_PER_PIXEL * 3;
-            let fraction = changed as f64 / rgb_channels as f64;
-            assert!(
-                (fraction - expected).abs() < FRACTION_TOLERANCE,
-                "x={} image RGB fraction {} not within {} of {}",
-                x,
-                fraction,
-                FRACTION_TOLERANCE,
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn image_trailing_bytes_untouched() {
-        // A payload that is not a whole number of pixels leaves its trailing
-        // bytes alone, exactly as a well-formed RGBA payload's remainder should.
-        const PIXELS: usize = 1_000;
-        const TRAILING: [u8; 2] = [0xDE, 0xAD];
-        let mut payload = vec![0u8; PIXELS * RGBA_BYTES_PER_PIXEL];
-        payload.extend_from_slice(&TRAILING);
-
-        corrupt(&mut payload, FileType::Image, 10.0);
-
-        assert_eq!(
-            &payload[payload.len() - TRAILING.len()..],
-            &TRAILING,
-            "trailing bytes were modified by image corruption"
-        );
-    }
-
-    #[test]
-    fn region_worker_reproduces_with_seeded_rng() {
-        // The pool-indexing logic is deterministic for a fixed stream: the same
-        // seed through the region worker must reproduce byte-identical output.
-        // This guards the draw accounting; the statistical tests guard the
-        // distribution.
-        let threshold = probability_threshold(10.0);
-        let original: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-
-        let mut a = original.clone();
-        region_work(
-            &mut a,
-            FileType::Text,
-            threshold,
-            &mut StdRng::seed_from_u64(42),
-        );
-        let mut b = original.clone();
-        region_work(
-            &mut b,
-            FileType::Text,
-            threshold,
-            &mut StdRng::seed_from_u64(42),
-        );
-        assert_eq!(a, b, "same seed must reproduce identical corruption");
-
-        let image_payload = vec![0u8; 4_000 * RGBA_BYTES_PER_PIXEL];
-        let mut image_a = image_payload.clone();
-        region_work(
-            &mut image_a,
-            FileType::Image,
-            threshold,
-            &mut StdRng::seed_from_u64(42),
-        );
-        let mut image_b = image_payload.clone();
-        region_work(
-            &mut image_b,
-            FileType::Image,
-            threshold,
-            &mut StdRng::seed_from_u64(42),
-        );
-        assert_eq!(
-            image_a, image_b,
-            "same seed must reproduce identical corruption"
+            "x=10 image RGB fraction {fraction} not within {FRACTION_TOLERANCE} of 0.632",
         );
     }
 }

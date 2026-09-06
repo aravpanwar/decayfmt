@@ -15,9 +15,17 @@ use std::path::Path;
 /// The four magic bytes that identify a decayfmt file: ASCII "DCYF".
 pub const MAGIC: [u8; 4] = *b"DCYF";
 
+/// The four magic bytes that identify a v2 decayfmt file: ASCII "DCF2". v2 is the
+/// encrypted, TPM-hardware-bound format; its parsing is not implemented yet.
+pub const MAGIC_V2: [u8; 4] = *b"DCF2";
+
 /// The format version this build reads and writes. An unknown version is refused,
 /// never interpreted, because the meaning of later versions is not knowable here.
 pub const VERSION: u8 = 0x01;
+
+/// The v2 format version, kept wider than v1's single byte to allow the header to
+/// grow. v2 is the encrypted, TPM-hardware-bound format; it is not parsed yet.
+pub const VERSION_V2: u16 = 2;
 
 /// file_type byte for an image payload (raw RGBA pixels).
 pub const FILE_TYPE_IMAGE: u8 = 0x01;
@@ -46,6 +54,11 @@ const RESERVED_LEN: usize = 2;
 /// Total size of the fixed header: 4 (magic) + 1 (version) + 1 (file_type)
 /// + 4 (width) + 4 (height) + 2 (reserved).
 pub const HEADER_SIZE: usize = RESERVED_OFFSET + RESERVED_LEN;
+
+/// Size of the fixed portion of a v2 header, before the two variable-length
+/// sealed-object fields: 4 (magic) + 2 (version) + 1 (file_type) + 4 (width)
+/// + 4 (height) + 4 (nv_index) + 8 (c0) + 12 (payload_nonce) + 32 (nv_auth).
+pub const HEADER_V2_FIXED_LEN: usize = 4 + 2 + 1 + 4 + 4 + 4 + 8 + 12 + 32;
 
 /// Which kind of payload follows the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +94,260 @@ impl FileType {
             FileType::Text => "text",
         }
     }
+}
+
+/// The v2 header: the encrypted, TPM-hardware-bound format. A v2 file is always bound
+/// to a TPM at encode time; there is no passphrase or portable key. It carries the
+/// payload type, dimensions, the TPM NV counter identity, the initial counter value,
+/// the single payload nonce, and the serialized public and private portions of the TPM
+/// sealed object that holds the content key K.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderV2 {
+    pub file_type: FileType,
+    pub width: u32,
+    pub height: u32,
+    pub nv_index: u32,
+    pub c0: u64,
+    pub payload_nonce: [u8; 12],
+    /// The per-file NV authorization value (32 random bytes) needed to read/increment the
+    /// counter. Stored in the header by design (it is not a secret or encryption key); the
+    /// security boundary is the TPM-backed monotonic counter.
+    pub nv_auth: [u8; 32],
+    pub sealed_pub: Vec<u8>,
+    pub sealed_priv: Vec<u8>,
+}
+
+impl HeaderV2 {
+    /// The maximum allowed size, in bytes, of a sealed-object blob in the v2 header.
+    /// Keeping an upper bound means a malformed header cannot force validation to inspect
+    /// an unbounded blob.
+    const MAX_BLOB_LEN: usize = 1 << 20;
+
+    /// Builds a v2 header for a file that is immediately bound to a TPM. The sealed
+    /// public and private parts (the TPM sealed object holding K), the NV counter
+    /// identity, the initial counter value, and the payload nonce are all supplied by
+    /// the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        file_type: FileType,
+        width: u32,
+        height: u32,
+        nv_index: u32,
+        c0: u64,
+        payload_nonce: [u8; 12],
+        sealed_pub: Vec<u8>,
+        sealed_priv: Vec<u8>,
+        nv_auth: [u8; 32],
+    ) -> Self {
+        HeaderV2 {
+            file_type,
+            width,
+            height,
+            nv_index,
+            c0,
+            payload_nonce,
+            nv_auth,
+            sealed_pub,
+            sealed_priv,
+        }
+    }
+
+    /// Validates the internal consistency of a v2 header.
+    ///
+    /// A v2 file is always TPM-bound, so it must carry non-empty sealed public and
+    /// private parts and a non-zero `nv_index`; every variable-length blob must stay
+    /// within the maximum blob size. Returns a typed [`DecayError`] naming the first
+    /// violated invariant.
+    pub fn validate(&self) -> Result<(), DecayError> {
+        if self.nv_index == 0 {
+            return Err(DecayError::InvalidHeaderV2 {
+                reason: "a bound v2 header requires a non-zero nv_index".to_string(),
+            });
+        }
+        match self.file_type {
+            FileType::Image => {
+                if self.width == 0 || self.height == 0 {
+                    return Err(DecayError::InvalidHeaderV2 {
+                        reason: "an image header requires non-zero width and height".to_string(),
+                    });
+                }
+            }
+            FileType::Text => {
+                if self.width != 0 || self.height != 0 {
+                    return Err(DecayError::InvalidHeaderV2 {
+                        reason: "a text header must have zero width and height".to_string(),
+                    });
+                }
+            }
+        }
+        if self.sealed_pub.is_empty() || self.sealed_priv.is_empty() {
+            return Err(DecayError::InvalidHeaderV2 {
+                reason: "bound header requires non-empty sealed public and private parts"
+                    .to_string(),
+            });
+        }
+
+        for blob in [&self.sealed_pub, &self.sealed_priv] {
+            if blob.len() > Self::MAX_BLOB_LEN {
+                return Err(DecayError::InvalidHeaderV2 {
+                    reason: format!(
+                        "variable-length blob ({} bytes) exceeds the maximum of {} bytes",
+                        blob.len(),
+                        Self::MAX_BLOB_LEN
+                    ),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Serializes this v2 header to its explicit binary on-disk form, appending the
+    /// bytes to `out`. Fixed fields first, then the two length-prefixed sealed-object
+    /// fields. Validation runs first, so an invalid header is never serialized.
+    pub fn write(&self, out: &mut Vec<u8>) -> Result<(), DecayError> {
+        self.validate()?;
+
+        out.extend_from_slice(&MAGIC_V2);
+        out.extend_from_slice(&VERSION_V2.to_le_bytes());
+        out.push(self.file_type.to_byte());
+        out.extend_from_slice(&self.width.to_le_bytes());
+        out.extend_from_slice(&self.height.to_le_bytes());
+        out.extend_from_slice(&self.nv_index.to_le_bytes());
+        out.extend_from_slice(&self.c0.to_le_bytes());
+        out.extend_from_slice(&self.payload_nonce);
+        out.extend_from_slice(&self.nv_auth);
+
+        write_blob(out, Some(self.sealed_pub.as_slice()));
+        write_blob(out, Some(self.sealed_priv.as_slice()));
+
+        Ok(())
+    }
+
+    /// Parses a v2 header from the start of `bytes`, returning the header and the number
+    /// of bytes consumed so the caller can locate the encrypted payload that follows.
+    /// Verifies the magic and version, rejects unknown file types, bounds checks every
+    /// length and offset, and re-runs validation before returning. No I/O.
+    pub fn read(bytes: &[u8]) -> Result<(Self, usize), DecayError> {
+        let mut pos = 0usize;
+
+        let magic = take::<4>(bytes, &mut pos)?;
+        if magic != MAGIC_V2 {
+            return Err(DecayError::WrongMagic { found: magic });
+        }
+
+        let version = u16::from_le_bytes(take::<2>(bytes, &mut pos)?);
+        if version != VERSION_V2 {
+            return Err(DecayError::UnsupportedVersion {
+                found: version as u8,
+            });
+        }
+
+        let file_type = FileType::from_byte(take::<1>(bytes, &mut pos)?[0])?;
+        let width = u32::from_le_bytes(take::<4>(bytes, &mut pos)?);
+        let height = u32::from_le_bytes(take::<4>(bytes, &mut pos)?);
+
+        let nv_index = u32::from_le_bytes(take::<4>(bytes, &mut pos)?);
+        let c0 = u64::from_le_bytes(take::<8>(bytes, &mut pos)?);
+        let payload_nonce = take::<12>(bytes, &mut pos)?;
+        let nv_auth = take::<32>(bytes, &mut pos)?;
+
+        let sealed_pub = read_blob(bytes, &mut pos)?;
+        let sealed_priv = read_blob(bytes, &mut pos)?;
+
+        let header = HeaderV2 {
+            file_type,
+            width,
+            height,
+            nv_index,
+            c0,
+            payload_nonce,
+            nv_auth,
+            sealed_pub,
+            sealed_priv,
+        };
+
+        header.validate()?;
+
+        Ok((header, pos))
+    }
+
+    /// Builds the canonical bytes authenticated as the payload AAD.
+    ///
+    /// This is exactly the canonical serialized v2 header bytes produced by
+    /// [`HeaderV2::write`], so the payload is bound to every header field: magic,
+    /// version, file type, dimensions, `nv_index`, `c0`, the payload nonce, and
+    /// the TPM sealed object. It deliberately excludes the payload/ciphertext. Callers
+    /// pass these exact bytes as the AAD to both the payload encrypt and decrypt
+    /// primitives so the two operations authenticate the same bytes.
+    pub fn payload_aad(&self) -> Result<Vec<u8>, DecayError> {
+        let mut out = Vec::new();
+        self.write(&mut out)?;
+        Ok(out)
+    }
+}
+
+/// Appends one length-prefixed variable-length field: a u32 little-endian length,
+/// then that many bytes. `None` is written as length 0 with no payload bytes.
+fn write_blob(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
+    let len = bytes.map_or(0, |data| data.len() as u32);
+    out.extend_from_slice(&len.to_le_bytes());
+    if let Some(data) = bytes {
+        out.extend_from_slice(data);
+    }
+}
+
+/// Reads `N` bytes at the cursor `*pos`, advancing it, and rejects a short buffer or an
+/// offset that would overflow.
+fn take<const N: usize>(bytes: &[u8], pos: &mut usize) -> Result<[u8; N], DecayError> {
+    let end = (*pos).checked_add(N).ok_or(DecayError::InvalidHeaderV2 {
+        reason: "v2 header offset overflow".to_string(),
+    })?;
+    if end > bytes.len() {
+        return Err(DecayError::InvalidHeaderV2 {
+            reason: format!(
+                "truncated v2 header: need {} bytes at offset {}, but the buffer has {} bytes",
+                N,
+                *pos,
+                bytes.len()
+            ),
+        });
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes[*pos..end]);
+    *pos = end;
+    Ok(out)
+}
+
+/// Reads one length-prefixed variable-length field, rejecting a length above the maximum
+/// blob size and a length that extends past the buffer.
+fn read_blob(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>, DecayError> {
+    let len = u32::from_le_bytes(take::<4>(bytes, pos)?) as usize;
+    if len > HeaderV2::MAX_BLOB_LEN {
+        return Err(DecayError::InvalidHeaderV2 {
+            reason: format!(
+                "variable-length blob length {} exceeds the maximum of {} bytes",
+                len,
+                HeaderV2::MAX_BLOB_LEN
+            ),
+        });
+    }
+    let end = (*pos).checked_add(len).ok_or(DecayError::InvalidHeaderV2 {
+        reason: "v2 header offset overflow".to_string(),
+    })?;
+    if end > bytes.len() {
+        return Err(DecayError::InvalidHeaderV2 {
+            reason: format!(
+                "truncated v2 header: blob of {} bytes at offset {} extends past the buffer of {} bytes",
+                len,
+                *pos,
+                bytes.len()
+            ),
+        });
+    }
+    let data = bytes[*pos..end].to_vec();
+    *pos = end;
+    Ok(data)
 }
 
 /// Parses the decayfmt filename convention into the payload type and instability x.
@@ -301,7 +568,7 @@ mod tests {
         bytes[0] = b'X';
         match Header::read(&bytes) {
             Err(DecayError::WrongMagic { found }) => assert_eq!(found[0], b'X'),
-            other => panic!("expected WrongMagic, got {:?}", other),
+            other => panic!("expected WrongMagic, got {other:?}"),
         }
     }
 
@@ -311,7 +578,7 @@ mod tests {
         bytes[4] = 0x02;
         match Header::read(&bytes) {
             Err(DecayError::UnsupportedVersion { found }) => assert_eq!(found, 0x02),
-            other => panic!("expected UnsupportedVersion, got {:?}", other),
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
         }
     }
 
@@ -321,7 +588,7 @@ mod tests {
         bytes[5] = 0x09;
         match Header::read(&bytes) {
             Err(DecayError::UnsupportedFileType { found }) => assert_eq!(found, 0x09),
-            other => panic!("expected UnsupportedFileType, got {:?}", other),
+            other => panic!("expected UnsupportedFileType, got {other:?}"),
         }
     }
 
@@ -333,7 +600,7 @@ mod tests {
                 assert_eq!(found, HEADER_SIZE - 1);
                 assert_eq!(needed, HEADER_SIZE);
             }
-            other => panic!("expected PayloadTooSmall, got {:?}", other),
+            other => panic!("expected PayloadTooSmall, got {other:?}"),
         }
     }
 
@@ -376,8 +643,7 @@ mod tests {
                     parse_filename(Path::new(name)),
                     Err(DecayError::UnrecognizedExtension { .. })
                 ),
-                "'{}' should be an unrecognized extension",
-                name
+                "'{name}' should be an unrecognized extension",
             );
         }
     }
@@ -390,8 +656,7 @@ mod tests {
                     parse_filename(Path::new(name)),
                     Err(DecayError::FilenameNoX { .. })
                 ),
-                "'{}' should yield FilenameNoX",
-                name
+                "'{name}' should yield FilenameNoX",
             );
         }
     }
@@ -412,5 +677,304 @@ mod tests {
             parse_filename(Path::new("photo.idcy99999999999")),
             Err(DecayError::XOutOfRange { .. })
         ));
+    }
+
+    /// A small, valid payload nonce used in HeaderV2 tests.
+    const TEST_NONCE: [u8; 12] = [0xCD; 12];
+
+    /// A small, valid 32-byte NV authorization value used in HeaderV2 tests.
+    const TEST_NV_AUTH: [u8; 32] = [0xAB; 32];
+
+    /// Returns a minimal valid v2 (TPM-bound) header for HeaderV2 tests.
+    fn valid_header() -> HeaderV2 {
+        HeaderV2::new(
+            FileType::Image,
+            2,
+            2,
+            7,
+            12345,
+            TEST_NONCE,
+            vec![4, 5, 6],
+            vec![7, 8, 9],
+            TEST_NV_AUTH,
+        )
+    }
+
+    #[test]
+    fn v2_constructor_sets_expected_fields() {
+        let header = valid_header();
+        assert_eq!(header.file_type, FileType::Image);
+        assert_eq!(header.width, 2);
+        assert_eq!(header.height, 2);
+        assert_eq!(header.nv_index, 7);
+        assert_eq!(header.c0, 12345);
+        assert_eq!(header.payload_nonce, TEST_NONCE);
+        assert_eq!(header.nv_auth, TEST_NV_AUTH);
+        assert_eq!(header.sealed_pub, vec![4, 5, 6]);
+        assert_eq!(header.sealed_priv, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn valid_v2_header_passes_validation() {
+        valid_header()
+            .validate()
+            .expect("a valid v2 header must validate");
+    }
+
+    #[test]
+    fn zero_nv_index_is_rejected() {
+        let header = HeaderV2::new(
+            FileType::Text,
+            0,
+            0,
+            0,
+            12345,
+            TEST_NONCE,
+            vec![4],
+            vec![5],
+            TEST_NV_AUTH,
+        );
+        assert!(matches!(
+            header.validate(),
+            Err(DecayError::InvalidHeaderV2 { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_sealed_pub_is_rejected() {
+        let header = HeaderV2::new(
+            FileType::Text,
+            0,
+            0,
+            7,
+            12345,
+            TEST_NONCE,
+            Vec::new(),
+            vec![5],
+            TEST_NV_AUTH,
+        );
+        assert!(matches!(
+            header.validate(),
+            Err(DecayError::InvalidHeaderV2 { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_sealed_priv_is_rejected() {
+        let header = HeaderV2::new(
+            FileType::Text,
+            0,
+            0,
+            7,
+            12345,
+            TEST_NONCE,
+            vec![4],
+            Vec::new(),
+            TEST_NV_AUTH,
+        );
+        assert!(matches!(
+            header.validate(),
+            Err(DecayError::InvalidHeaderV2 { .. })
+        ));
+    }
+
+    #[test]
+    fn oversized_blob_is_rejected() {
+        let header = HeaderV2::new(
+            FileType::Text,
+            0,
+            0,
+            7,
+            12345,
+            TEST_NONCE,
+            vec![0u8; HeaderV2::MAX_BLOB_LEN + 1],
+            vec![5],
+            TEST_NV_AUTH,
+        );
+        assert!(matches!(
+            header.validate(),
+            Err(DecayError::InvalidHeaderV2 { .. })
+        ));
+    }
+
+    #[test]
+    fn v2_round_trip() {
+        let header = valid_header();
+        let mut bytes = Vec::new();
+        header.write(&mut bytes).expect("header must serialize");
+
+        let (parsed, consumed) = HeaderV2::read(&bytes).expect("header must parse");
+        assert_eq!(parsed, header);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn v2_deterministic_serialization() {
+        let header = valid_header();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        header.write(&mut first).expect("first write");
+        header.write(&mut second).expect("second write");
+        assert_eq!(first, second, "serialization must be deterministic");
+    }
+
+    #[test]
+    fn v2_magic_and_version_bytes_are_exact() {
+        let mut bytes = Vec::new();
+        valid_header().write(&mut bytes).expect("write header");
+        assert_eq!(&bytes[0..4], &MAGIC_V2[..], "magic bytes must be DCF2");
+        assert_eq!(
+            &bytes[4..6],
+            &VERSION_V2.to_le_bytes()[..],
+            "version must be 2 little-endian"
+        );
+    }
+
+    #[test]
+    fn v2_truncated_fixed_header_is_rejected() {
+        let mut bytes = Vec::new();
+        valid_header().write(&mut bytes).expect("write header");
+        let short = &bytes[..HEADER_V2_FIXED_LEN - 1];
+        assert!(matches!(
+            HeaderV2::read(short),
+            Err(DecayError::InvalidHeaderV2 { .. })
+        ));
+    }
+
+    #[test]
+    fn v2_truncated_variable_field_is_rejected() {
+        let mut bytes = Vec::new();
+        valid_header().write(&mut bytes).expect("write header");
+        // Trim two bytes off the trailing sealed_priv content; its length field still
+        // claims three bytes, so read_blob must report a truncated buffer.
+        let short = &bytes[..bytes.len() - 2];
+        assert!(matches!(
+            HeaderV2::read(short),
+            Err(DecayError::InvalidHeaderV2 { .. })
+        ));
+    }
+
+    #[test]
+    fn v2_oversized_variable_field_is_rejected() {
+        let mut bytes = Vec::new();
+        valid_header().write(&mut bytes).expect("write header");
+        // The first sealed-object length field sits at the end of the fixed region.
+        let oversized = (HeaderV2::MAX_BLOB_LEN as u32) + 1;
+        bytes[HEADER_V2_FIXED_LEN..HEADER_V2_FIXED_LEN + 4]
+            .copy_from_slice(&oversized.to_le_bytes());
+        assert!(matches!(
+            HeaderV2::read(&bytes),
+            Err(DecayError::InvalidHeaderV2 { .. })
+        ));
+    }
+
+    #[test]
+    fn v2_invalid_file_type_is_rejected() {
+        let mut bytes = Vec::new();
+        valid_header().write(&mut bytes).expect("write header");
+        bytes[6] = 0x09; // file_type byte, offset 6
+        assert!(matches!(
+            HeaderV2::read(&bytes),
+            Err(DecayError::UnsupportedFileType { .. })
+        ));
+    }
+
+    #[test]
+    fn v2_fixed_fields_are_serialized_in_layout_order() {
+        let header = valid_header();
+        let mut bytes = Vec::new();
+        header.write(&mut bytes).expect("write header");
+
+        // payload_nonce sits at offset 27 in the fixed region, followed by the 32-byte
+        // nv_auth at offset 39.
+        assert_eq!(
+            &bytes[27..39],
+            &TEST_NONCE[..],
+            "payload_nonce at offset 27"
+        );
+        assert_eq!(&bytes[39..71], &TEST_NV_AUTH[..], "nv_auth at offset 39");
+
+        let (parsed, _) = HeaderV2::read(&bytes).expect("header must parse");
+        assert_eq!(parsed.payload_nonce, TEST_NONCE);
+        assert_eq!(parsed.nv_auth, TEST_NV_AUTH);
+    }
+
+    #[test]
+    fn payload_aad_equals_write_bytes() {
+        let header = valid_header();
+        let aad = header.payload_aad().expect("payload AAD");
+        let mut written = Vec::new();
+        header.write(&mut written).expect("write header");
+        assert_eq!(
+            aad, written,
+            "payload AAD must equal the canonical serialized header bytes"
+        );
+    }
+
+    #[test]
+    fn identical_headers_have_identical_aad() {
+        let a = valid_header();
+        let b = valid_header();
+        assert_eq!(
+            a.payload_aad().expect("AAD"),
+            b.payload_aad().expect("AAD"),
+            "identical headers must produce identical AAD"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn changing_any_authored_header_field_changes_aad() {
+        let base_aad = valid_header().payload_aad().expect("base AAD");
+
+        // Each closure is a non-capturing mutation that coerces to a fn pointer, so the
+        // array holds a homogeneous type.
+        let cases: [(&str, fn(&mut HeaderV2)); 9] = [
+            ("file_type", |h: &mut HeaderV2| {
+                h.file_type = FileType::Text;
+                h.width = 0;
+                h.height = 0;
+            }),
+            ("width", |h: &mut HeaderV2| h.width += 1),
+            ("height", |h: &mut HeaderV2| h.height += 1),
+            ("nv_index", |h: &mut HeaderV2| h.nv_index += 1),
+            ("c0", |h: &mut HeaderV2| h.c0 += 1),
+            ("payload_nonce", |h: &mut HeaderV2| {
+                h.payload_nonce[0] ^= 0xFF
+            }),
+            ("nv_auth", |h: &mut HeaderV2| h.nv_auth[0] ^= 0xFF),
+            ("sealed_pub", |h: &mut HeaderV2| h.sealed_pub[0] ^= 0xFF),
+            ("sealed_priv", |h: &mut HeaderV2| h.sealed_priv[0] ^= 0xFF),
+        ];
+
+        for (name, mutate) in cases {
+            let mut header = valid_header();
+            mutate(&mut header);
+            let aad = header.payload_aad().expect("AAD must remain valid");
+            assert_ne!(
+                aad, base_aad,
+                "changing the {name} field must change the payload AAD"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_aad_round_trips_through_crypto() {
+        use crate::crypto::{
+            decrypt_payload, encrypt_payload, generate_content_key, generate_payload_nonce,
+        };
+
+        let header = valid_header();
+        let aad = header.payload_aad().expect("payload AAD");
+        let key = generate_content_key();
+        let nonce = generate_payload_nonce();
+        let plaintext: &[u8] = b"the canonical payload bytes";
+
+        let ct = encrypt_payload(&key, plaintext, &nonce, &aad).expect("encrypt payload");
+        let pt = decrypt_payload(&key, &ct, &nonce, &aad).expect("decrypt payload");
+        assert_eq!(
+            pt, plaintext,
+            "AAD must round-trip unchanged through the crypto primitives"
+        );
     }
 }

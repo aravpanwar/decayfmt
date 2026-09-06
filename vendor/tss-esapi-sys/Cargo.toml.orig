@@ -1,0 +1,22 @@
+[package]
+name = "tss-esapi-sys"
+version = "0.6.0"
+authors = ["Parsec Project Contributors"]
+edition = "2018"
+description = "FFI wrapper around TSS 2.0 Enhanced System API"
+readme = "README.md"
+keywords = ["tpm", "tss", "esys", "esapi"]
+categories = ["api-bindings", "external-ffi-bindings", "cryptography"]
+license = "Apache-2.0"
+repository = "https://github.com/parallaxsecond/rust-tss-esapi"
+documentation = "https://docs.rs/crate/tss-esapi-sys"
+links = "tss2-esys"
+rust-version = "1.85.0"
+
+[build-dependencies]
+bindgen = { version = "0.72.1", optional = true }
+pkg-config = "0.3.18"
+target-lexicon = "0.12.0"
+
+[features]
+generate-bindings = ["bindgen"]

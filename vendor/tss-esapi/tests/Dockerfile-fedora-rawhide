@@ -1,0 +1,8 @@
+FROM fedora:rawhide
+
+RUN dnf install -y \
+	tpm2-tss-devel tpm2-abrmd tpm2-tools \
+	swtpm swtpm-tools swtpm-selinux\
+	rust clippy cargo \
+	llvm llvm-devel clang pkg-config \
+	dbus-daemon rust-gobject-sys-devel

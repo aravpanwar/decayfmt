@@ -1,0 +1,27 @@
+FROM ghcr.io/tpm2-software/ubuntu-18.04:latest AS base
+
+FROM base AS rust-toolchain
+# Install Rust toolchain
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+FROM rust-toolchain AS tpm2-tss
+# Download and install the TSS library
+ARG TPM2_TSS_VERSION=2.4.6
+ENV TPM2_TSS_VERSION=$TPM2_TSS_VERSION
+ENV PKG_CONFIG_PATH /usr/local/lib/pkgconfig
+RUN git clone https://github.com/tpm2-software/tpm2-tss.git --branch $TPM2_TSS_VERSION
+RUN cd tpm2-tss \
+	&& ./bootstrap \
+	&& ./configure \
+	&& make -j$(nproc) \
+	&& make install \
+	&& ldconfig
+
+FROM tpm2-tss AS tpm2-tools
+# Download and install TPM2 tools
+RUN git clone https://github.com/tpm2-software/tpm2-tools.git --branch 4.1
+RUN cd tpm2-tools \
+	&& ./bootstrap \
+	&& ./configure --enable-unit \
+	&& make install
