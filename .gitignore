@@ -30,3 +30,7 @@ findings.md
 /src/bin/ms_provision_client.rs
 /src/bin/ms_nv_sample.rs
 /src/bin/ms_seal_sample.rs
+
+# Local release packages.
+/release-windows/
+/decayfmt-v0.2.0-windows-x64.zip

@@ -1,8 +1,7 @@
-//! TEMPORARY experiment / Windows-only prototype: a native Windows service that provisions TPM
-//! NV decay counters over a local named pipe.
+//! A native Windows service that provisions TPM NV decay counters over a local named pipe.
 //!
 //! The service exposes a single, well-defined operation, `AllocateCounter`, over the named pipe
-//! `\\.\pipe\decayfmt-provision-test`. It does NOT expose arbitrary TPM commands: the only TPM
+//! `\\.\pipe\decayfmt-provision`. It does NOT expose arbitrary TPM commands: the only TPM
 //! work it does is call the existing production `TpmContext::allocate_counter()` implementation
 //! (the same one the v2 encoder uses) and return the resulting NV index and initial counter value
 //! `c0`. Requests are handled sequentially on a single pipe instance.
@@ -10,7 +9,7 @@
 //! Lifecycle / usage:
 //!   * `--install`   register a Windows SCM service (auto start) using the current exe path.
 //!   * `--uninstall` stop (if running) and delete that service.
-//!   * `--console`   run the provisioner in the foreground (original prototype behavior).
+//!   * `--console`   run the provisioner in the foreground.
 //!   * (no mode)     run under the SCM via `StartServiceCtrlDispatcherW`.
 //!
 //! Windows-only by construction. On non-Windows hosts this binary is a harmless no-op so the
@@ -54,7 +53,7 @@ mod provisioner {
     const ERROR_PIPE_CONNECTED: u32 = 535;
 
     /// The local named pipe this service serves.
-    const PIPE_NAME: &str = r"\\.\pipe\decayfmt-provision-test";
+    const PIPE_NAME: &str = r"\\.\pipe\decayfmt-provision";
 
     /// SDDL DACL for the pipe: deny NETWORK logons (S-1-5-2) first, then allow AUTHENTICATED
     /// USERS (S-1-5-11). A remote client connects under a network logon whose token carries the
@@ -67,7 +66,7 @@ mod provisioner {
     const MAX_REQUEST_BYTES: usize = 1024;
 
     /// The Windows SCM service name (and display name) registered by `--install`.
-    const SERVICE_NAME: &str = "DecayFmtProvisionerTest";
+    const SERVICE_NAME: &str = "DecayFmtProvisioner";
 
     // Service control manager / service type constants (winsvc.h).
     const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
@@ -85,7 +84,7 @@ mod provisioner {
     const SC_MANAGER_ALL_ACCESS: u32 = 0x000F_003F;
     const SERVICE_ALL_ACCESS: u32 = 0x000F_01FF;
 
-    // Win32 error codes referenced by this prototype.
+    // Win32 error codes referenced by this service.
     const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
     const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: u32 = 1063;
     const ERROR_SERVICE_EXISTS: u32 = 1073;
@@ -245,8 +244,8 @@ mod provisioner {
         dispatch_service()
     }
 
-    /// Extracts the TCTI from `--tcti <name>` or a bare positional argument, mirroring the
-    /// original prototype's argument handling. Mode flags are skipped.
+    /// Extracts the TCTI from `--tcti <name>` or a bare positional argument; mode flags are
+    /// skipped.
     fn tcti_from_args(args: &[String]) -> Option<String> {
         let mut index = 0;
         while index < args.len() {
@@ -607,8 +606,7 @@ mod provisioner {
     }
 
     /// Runs the request loop until the SCM requests a stop (service mode) or a fatal pipe error
-    /// occurs. In `--console` mode `STOP_REQUESTED` is never set, so this blocks like the original
-    /// prototype.
+    /// occurs. In `--console` mode `STOP_REQUESTED` is never set, so this blocks indefinitely.
     fn provisioner_serve(provisioner: &mut Provisioner) -> Result<(), String> {
         let pipe = provisioner.pipe;
         loop {

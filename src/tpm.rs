@@ -1082,7 +1082,7 @@ mod tests {
 /// service over its named pipe, instead of defining the counter on the local TPM.
 ///
 /// This is the production counterpart of `src/bin/ms_provision_client.rs`: it connects to
-/// `\\.\pipe\decayfmt-provision-test`, sends exactly `AllocateCounter\n`, and parses the service's
+/// `\\.\pipe\decayfmt-provision`, sends exactly `AllocateCounter\n`, and parses the service's
 /// `OK nv_index=0x... c0=...\n` reply. It performs no sealing and no other TPM work; the local
 /// `TpmContext` still seals the content key itself against the Windows TPM (TBS). The same
 /// hand-written Win32 FFI style is used (no extra dependency), and the module only compiles on
@@ -1094,7 +1094,7 @@ mod windows_provision {
     use super::{CounterInfo, DecayError};
 
     /// The named pipe served by the `DecayFmtProvisionerTest` Windows service.
-    const PIPE_NAME: &str = r"\\.\pipe\decayfmt-provision-test";
+    const PIPE_NAME: &str = r"\\.\pipe\decayfmt-provision";
 
     // CreateFileW constants (winnt.h / winbase.h).
     const GENERIC_READ: u32 = 0x8000_0000;
