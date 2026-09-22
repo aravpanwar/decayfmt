@@ -33,7 +33,7 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -55,7 +55,7 @@ jobs:
         run: Compress-Archive -Path "target/${{ matrix.target }}/release/decayfmt.exe" -DestinationPath "decayfmt-${{ matrix.target }}.zip"
 
       - name: attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: decayfmt-${{ matrix.target }}.*
 
@@ -72,7 +72,7 @@ jobs:
       contents: read
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
