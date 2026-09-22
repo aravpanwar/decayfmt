@@ -23,8 +23,8 @@ jobs:
           - os: windows-latest # x86_64 msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,7 @@ jobs:
           "$BIN/pip" install target/wheels/*.whl
           "$BIN/python" python/tests/smoke.py
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
           path: target/wheels
@@ -59,7 +59,7 @@ jobs:
       contents: read
     environment: pypi
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: target/wheels
           merge-multiple: true
