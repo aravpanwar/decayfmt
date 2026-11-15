@@ -1,5 +1,10 @@
 # decayfmt-py
 
+> **This package is no longer maintained.** 0.2.1 is the final release. It stays
+> installable and works with files written by decayfmt 0.2, but it will not follow
+> later versions of the format. The Rust crate and CLI continue at
+> [decayfmt](https://github.com/aravpanwar/decayfmt).
+
 A file format where decay is a first-class property: **every open permanently corrupts the file.**
 
 This is the Python binding for the [decayfmt](https://github.com/aravpanwar/decayfmt) format. Install it with `pip install decayfmt-py`; the module you import is `decayfmt`. Encode a clean file once, then let it decay one open at a time. Each open replaces a random slice of the payload with noise and writes it back to disk. A corrupted file cannot be restored from its own contents. The header is immutable; only the payload decays.
