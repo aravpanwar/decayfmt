@@ -10,9 +10,10 @@
 
 use decayfmt_core::error::DecayError;
 use decayfmt_core::format::{FileType, Header, AUDIO_BITS_PER_SAMPLE};
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyOSError, PyPermissionError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyByteArrayMethods, PyBytes, PyBytesMethods};
+use pyo3::types::{PyByteArray, PyBytes, PyBytesMethods};
 use std::path::Path;
 
 /// Maps a `DecayError` to the built-in Python exception that best matches it.
@@ -44,7 +45,8 @@ fn file_type_from_str(kind: &str) -> PyResult<FileType> {
 ///
 /// Each eligible byte is independently replaced with probability
 /// `1 - exp(-x / 10)`; image payloads corrupt R, G, and B channels only and
-/// never touch alpha, text payloads are replaced with printable ASCII. `x` is
+/// never touch alpha, text payloads are replaced with printable ASCII, and audio
+/// payloads displace whole 16-bit samples by an amount bounded by `x`. `x` is
 /// not clamped: `x <= 0` corrupts nothing, and larger `x` approaches corrupting
 /// every byte. Because Python bytes are immutable, the input is copied once;
 /// use `corrupt_in_place` on a `bytearray` to avoid the copy.
@@ -68,7 +70,8 @@ fn corrupt_bytes(
 ///
 /// Same statistics as `corrupt_bytes`, but mutates the given buffer directly.
 /// Pass a `memoryview` by first converting it with `bytearray(mv)`. The GIL is
-/// released while corruption runs.
+/// released while corruption runs; resizing the bytearray from another thread
+/// during the call raises `BufferError` in that thread.
 #[pyfunction]
 fn corrupt_in_place(
     py: Python<'_>,
@@ -77,11 +80,23 @@ fn corrupt_in_place(
     kind: &str,
 ) -> PyResult<()> {
     let file_type = file_type_from_str(kind)?;
-    // SAFETY: the slice is taken while the GIL is held and consumed entirely by
-    // the detach closure below; concurrent mutation of a bytearray from another
-    // Python thread is a race in plain Python too and is not protected here.
-    let bytes = unsafe { buffer.as_bytes_mut() };
+    // The bytes are reached through a buffer export rather than a bare slice of the
+    // bytearray. While an export is alive Python refuses to resize the bytearray, so
+    // another thread that appends to or clears it during the detach below gets a
+    // BufferError instead of freeing the storage this slice points into. A bare slice
+    // would dangle in that case, because the GIL is not held while corruption runs.
+    let view = PyBuffer::<u8>::get(buffer.as_any())?;
+    let mut pointer = view
+        .as_slice_ptr()
+        .ok_or_else(|| PyValueError::new_err("expected a contiguous buffer"))?;
+    // SAFETY: `view` outlives the slice and pins the allocation at this address and
+    // length for as long as it is held. Another Python thread can still write to the
+    // same bytes while the GIL is released; that is a race on the contents only, as
+    // it is for any extension that releases the GIL over a buffer, never on the
+    // allocation itself.
+    let bytes = unsafe { pointer.as_mut() };
     py.detach(|| decayfmt_core::corrupt::corrupt(bytes, file_type, x));
+    drop(view);
     Ok(())
 }
 
@@ -102,9 +117,8 @@ fn encode_file(py: Python<'_>, source_path: &str, output_path: &str) -> PyResult
 ///
 /// The bytes are treated as a source file: decoded to raw RGBA for image
 /// output names, validated as UTF-8 for text names, and decoded to raw PCM for
-/// audio names. Useful for sources
-/// that are already in memory (e.g. an image from PIL), or when `encode_file`
-/// would require a temporary file.
+/// audio names. Useful for sources that are already in memory (e.g. an image
+/// from PIL), or when `encode_file` would require a temporary file.
 #[pyfunction]
 fn encode_bytes(py: Python<'_>, source: &Bound<'_, PyBytes>, output_path: &str) -> PyResult<()> {
     let bytes = source.as_bytes().to_vec();
