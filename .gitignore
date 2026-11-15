@@ -3,15 +3,6 @@
 # Locally generated decay demo frames, kept out of the repo.
 /demo
 
-# Python bindings build artifacts.
-/python/.venv/
-/python/*.so
-/python/*.pyd
-/python/__pycache__/
-/python/tests/__pycache__/
-/dist/
-/target/wheels/
-
 # Documentation lives locally and is never committed.
 CLAUDE.md
 project.md

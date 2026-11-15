@@ -34,8 +34,3 @@ harness = false
 [[bench]]
 name = "encode"
 harness = false
-
-[workspace]
-members = ["python"]
-default-members = ["."]
-resolver = "2"
