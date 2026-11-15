@@ -75,9 +75,30 @@ def main():
     assert changed > len(img) // 4, f"only {changed} rgb bytes were corrupted"
     print("PASS image alpha channel preserved")
 
+    # --- corrupt_in_place pins the buffer while it runs ------------------------
+    # The call must leave the bytearray resizable afterwards: a buffer export that
+    # outlived the call would make every later append raise BufferError.
+    pinned = bytearray(b"a" * 4096)
+    decayfmt.corrupt_in_place(pinned, 10.0, "text")
+    pinned.extend(b"tail")
+    assert len(pinned) == 4100
+    print("PASS corrupt_in_place releases its buffer export")
+
+    # --- audio corruption displaces samples, never changes length -------------
+    samples = (8000).to_bytes(2, "little", signed=True) * 50_000
+    decayed = decayfmt.corrupt_bytes(samples, 10.0, "audio")
+    assert len(decayed) == len(samples), "audio corruption changed the length"
+    moved = sum(
+        decayed[i : i + 2] != samples[i : i + 2] for i in range(0, len(samples), 2)
+    )
+    share = moved / (len(samples) // 2)
+    assert 0.61 < share < 0.65, f"x=10 displaced {share} of samples"
+    print(f"PASS audio corruption statistics (x=10: {share:.4f})")
+
     # --- filename parsing ----------------------------------------------------
     assert decayfmt.parse_filename("photo.idcy3") == ("image", 3.0)
     assert decayfmt.parse_filename("note.tdcy12") == ("text", 12.0)
+    assert decayfmt.parse_filename("clip.adcy5") == ("audio", 5.0)
     for bad in ["plain.txt", "photo.idcy", "photo.idcyx", "photo.idcy0"]:
         try:
             decayfmt.parse_filename(bad)
@@ -93,11 +114,15 @@ def main():
     assert decayfmt.read_header(header) == ("image", (2, 2))
     text_header = decayfmt.write_header("text", None, None)
     assert decayfmt.read_header(text_header) == ("text", None)
-    try:
-        decayfmt.write_header("image", None, None)
-        raise AssertionError("image header without dimensions did not raise")
-    except ValueError:
-        pass
+    audio_header = decayfmt.write_header("audio", sample_rate=44_100, channels=2)
+    assert len(audio_header) == 16
+    assert decayfmt.read_header(audio_header) == ("audio", None)
+    for kind in ["image", "audio"]:
+        try:
+            decayfmt.write_header(kind, None, None)
+            raise AssertionError(f"{kind} header without its metadata did not raise")
+        except ValueError:
+            pass
     print("PASS write_header/read_header round trips")
 
     # --- encode + decay_file on a text file -----------------------------------

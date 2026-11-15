@@ -123,7 +123,7 @@ def show_exception(label, fn):
         raise AssertionError(f"{label} did not raise!")
 
 
-# ValueError: kind must be "image" or "text"
+# ValueError: kind must be "image", "text", or "audio"
 show_exception("corrupt_bytes(bad kind)", lambda: decayfmt.corrupt_bytes(b"x", 1.0, "video"))
 
 # ValueError: filename does not fit the convention

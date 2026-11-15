@@ -584,14 +584,14 @@ mod tests {
             &mut a,
             FileType::Text,
             threshold,
-            &mut StdRng::seed_from_u64(42),
+            &mut StdRng::seed_from_u64(27325),
         );
         let mut b = original.clone();
         region_work(
             &mut b,
             FileType::Text,
             threshold,
-            &mut StdRng::seed_from_u64(42),
+            &mut StdRng::seed_from_u64(27325),
         );
         assert_eq!(a, b, "same seed must reproduce identical corruption");
 
@@ -601,14 +601,14 @@ mod tests {
             &mut image_a,
             FileType::Image,
             threshold,
-            &mut StdRng::seed_from_u64(42),
+            &mut StdRng::seed_from_u64(27325),
         );
         let mut image_b = image_payload.clone();
         region_work(
             &mut image_b,
             FileType::Image,
             threshold,
-            &mut StdRng::seed_from_u64(42),
+            &mut StdRng::seed_from_u64(27325),
         );
         assert_eq!(
             image_a, image_b,

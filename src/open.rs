@@ -304,7 +304,7 @@ pub fn cleanup_old_view_files() {
 }
 
 /// Hands a file to the operating system's default application for its type, used
-/// for both the display PNG and the display text file.
+/// for the display PNG, the display text file, and the playback WAV.
 ///
 /// Each platform exposes a different one-shot "open with the default application"
 /// command. The application is spawned and not waited on, so it stays open after
