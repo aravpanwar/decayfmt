@@ -30,7 +30,7 @@ const RGBA_BYTES_PER_PIXEL: usize = 4;
 /// any read or display and fails closed.
 fn ensure_writable(path: &Path) -> Result<(), DecayError> {
     let metadata = std::fs::metadata(path).map_err(|error| DecayError::Io {
-        context: format!("open: stat '{}'", path.display()),
+        context: format!("couldn't stat '{}'", path.display()),
         source: error,
     })?;
     if metadata.permissions().readonly() {
@@ -49,8 +49,8 @@ fn ensure_writable(path: &Path) -> Result<(), DecayError> {
 /// independent of the display path. The header is read but never changed; only the
 /// payload is corrupted.
 ///
-/// Public so embedding callers (such as the Python bindings) can commit an open
-/// without the display side of `open_file`.
+/// Public so embedding callers can commit an open without the display side of
+/// `open_file`.
 pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
     let (filename_type, x) = parse_filename(path)?;
     ensure_writable(path)?;
@@ -66,18 +66,18 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
         .write(true)
         .open(path)
         .map_err(|error| DecayError::Io {
-            context: format!("open: open '{}'", path.display()),
+            context: format!("couldn't open '{}'", path.display()),
             source: error,
         })?;
     file.lock_exclusive().map_err(|error| DecayError::Io {
-        context: format!("open: lock '{}' for a single open", path.display()),
+        context: format!("couldn't lock '{}' for a single open", path.display()),
         source: error,
     })?;
 
     let mut file_bytes = Vec::new();
     file.read_to_end(&mut file_bytes)
         .map_err(|error| DecayError::Io {
-            context: format!("open: read '{}'", path.display()),
+            context: format!("couldn't read '{}'", path.display()),
             source: error,
         })?;
 
@@ -105,12 +105,15 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
     // decays rather than bricking.
     file.seek(SeekFrom::Start(HEADER_SIZE as u64))
         .map_err(|error| DecayError::Io {
-            context: format!("open: seek past header in '{}'", path.display()),
+            context: format!("couldn't seek past the header in '{}'", path.display()),
             source: error,
         })?;
     file.write_all(&file_bytes[HEADER_SIZE..])
         .map_err(|error| DecayError::Io {
-            context: format!("open: write corrupted payload to '{}'", path.display()),
+            context: format!(
+                "couldn't write the corrupted payload to '{}'",
+                path.display()
+            ),
             source: error,
         })?;
 
@@ -123,7 +126,7 @@ pub fn decay_in_place(path: &Path) -> Result<(Header, Vec<u8>), DecayError> {
 /// metadata selects the display path, so each payload type is presented with the
 /// parameters it recorded at encode time.
 pub fn open_file(path: &Path) -> Result<(), DecayError> {
-    cleanup_old_view_files();
+    sweep_stale_view_files();
     let (header, file_bytes) = decay_in_place(path)?;
     let payload = &file_bytes[HEADER_SIZE..];
     match header.metadata {
@@ -158,7 +161,7 @@ fn display_text(payload: &[u8]) -> Result<(), DecayError> {
 
     let viewer_path = temporary_output_path("txt");
     std::fs::write(&viewer_path, text.as_bytes()).map_err(|error| DecayError::Io {
-        context: format!("open: write display text '{}'", viewer_path.display()),
+        context: format!("couldn't write display text '{}'", viewer_path.display()),
         source: error,
     })?;
     open_in_default_app(&viewer_path)
@@ -185,7 +188,7 @@ fn display_image(payload: &[u8], dimensions: ImageDimensions) -> Result<(), Deca
         .save(&viewer_path)
         .map_err(|error| DecayError::ImageEncode {
             context: format!(
-                "open: encode display png '{}': {}",
+                "couldn't encode display png '{}': {}",
                 viewer_path.display(),
                 error
             ),
@@ -209,14 +212,14 @@ fn play_audio(payload: &[u8], spec: AudioSpec) -> Result<(), DecayError> {
     if spec.bits_per_sample != AUDIO_BITS_PER_SAMPLE {
         return Err(DecayError::AudioEncode {
             context: format!(
-                "open: header declares {} bits per sample but this build only writes and plays {}.",
-                spec.bits_per_sample, AUDIO_BITS_PER_SAMPLE
+                "expected {} bits per sample in the header, found {}",
+                AUDIO_BITS_PER_SAMPLE, spec.bits_per_sample
             ),
         });
     }
     if spec.channels == 0 {
         return Err(DecayError::AudioEncode {
-            context: "open: header declares zero audio channels.".to_string(),
+            context: "expected at least one audio channel in the header, found zero".to_string(),
         });
     }
 
@@ -238,7 +241,7 @@ fn play_audio(payload: &[u8], spec: AudioSpec) -> Result<(), DecayError> {
     let viewer_path = temporary_output_path("wav");
     let encode_error = |message: String| DecayError::AudioEncode {
         context: format!(
-            "open: encode playback wav '{}': {}",
+            "couldn't encode playback wav '{}': {}",
             viewer_path.display(),
             message
         ),
@@ -272,7 +275,7 @@ fn play_audio(payload: &[u8], spec: AudioSpec) -> Result<(), DecayError> {
 /// Builds a unique path in the system temp directory for a display file with the
 /// given extension. The viewer is launched asynchronously so this file cannot be
 /// deleted immediately; instead every open sweeps the previous ones via
-/// [`cleanup_old_view_files`], so old snapshots do not accumulate.
+/// [`sweep_stale_view_files`], so old snapshots do not accumulate.
 fn temporary_output_path(extension: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -291,7 +294,7 @@ fn temporary_output_path(extension: &str) -> PathBuf {
 ///
 /// The file from the current open cannot be swept here, because the viewer is launched
 /// asynchronously and needs it to outlive this process.
-pub fn cleanup_old_view_files() {
+pub fn sweep_stale_view_files() {
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
@@ -326,7 +329,10 @@ fn open_in_default_app(path: &Path) -> Result<(), DecayError> {
     spawn_result
         .map(|_child| ())
         .map_err(|error| DecayError::Io {
-            context: format!("open: launch default viewer for '{}'", path.display()),
+            context: format!(
+                "couldn't launch the default viewer for '{}'",
+                path.display()
+            ),
             source: error,
         })
 }
@@ -336,16 +342,29 @@ mod tests {
     use super::*;
     use crate::encode::encode_file;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Builds a unique path in the system temp directory so concurrent test runs do
     /// not collide. The suffix carries the extension the test needs.
+    ///
+    /// The clock alone is not enough: tests run on parallel threads and some platforms
+    /// tick coarsely, so two tests asking for the same suffix can read the same instant.
+    /// The process id separates concurrent test binaries and the counter separates
+    /// threads within one.
     fn unique_temp_path(suffix: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("decayfmt_open_test_{}_{}", nanos, suffix))
+        std::env::temp_dir().join(format!(
+            "decayfmt_open_test_{}_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            suffix
+        ))
     }
 
     /// Builds a minimal 16-bit PCM WAV in memory so the audio tests do not need a
@@ -458,7 +477,7 @@ mod tests {
         fs::write(&stale, b"a less corrupted state").expect("write stale view file");
         assert!(stale.exists(), "the stale file must exist before the sweep");
 
-        cleanup_old_view_files();
+        sweep_stale_view_files();
 
         assert!(
             !stale.exists(),

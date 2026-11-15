@@ -25,7 +25,7 @@ const IN_MEMORY_SOURCE: &str = "<in-memory bytes>";
 pub fn decode_image(source_bytes: &[u8], input: &Path) -> Result<(u32, u32, Vec<u8>), DecayError> {
     let decoded =
         image::load_from_memory(source_bytes).map_err(|error| DecayError::ImageDecode {
-            context: format!("encode: decode image '{}': {}", input.display(), error),
+            context: format!("couldn't decode image '{}': {}", input.display(), error),
         })?;
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
@@ -50,7 +50,7 @@ pub fn decode_audio(source_bytes: &[u8], input: &Path) -> Result<(u32, u8, Vec<u
     use symphonia::core::meta::MetadataOptions;
 
     let decode_error = |message: String| DecayError::AudioDecode {
-        context: format!("encode: decode audio '{}': {}", input.display(), message),
+        context: format!("couldn't decode audio '{}': {}", input.display(), message),
     };
 
     // symphonia reads from a seekable stream; the source is already in memory.
@@ -166,7 +166,7 @@ pub fn text_payload(source_bytes: Vec<u8>) -> Result<Vec<u8>, DecayError> {
 /// buffer; the bytes on disk are identical to writing one concatenated buffer.
 pub fn write_decayfmt(output: &Path, header: Header, payload: &[u8]) -> Result<(), DecayError> {
     let write_error = |error| DecayError::Io {
-        context: format!("encode: write output '{}'", output.display()),
+        context: format!("couldn't write output '{}'", output.display()),
         source: error,
     };
     let mut file = fs::File::create(output).map_err(write_error)?;
@@ -190,7 +190,7 @@ pub fn encode_file(input: &Path, output: &Path) -> Result<(), DecayError> {
     let (file_type, _x) = crate::format::parse_filename(output)?;
 
     let source_bytes = fs::read(input).map_err(|error| DecayError::Io {
-        context: format!("encode: read input '{}'", input.display()),
+        context: format!("couldn't read input '{}'", input.display()),
         source: error,
     })?;
 
@@ -248,16 +248,29 @@ mod tests {
     use super::*;
     use crate::format::{ImageDimensions, FILE_TYPE_TEXT, HEADER_SIZE, MAGIC, VERSION};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Builds a unique path in the system temp directory so concurrent test runs do
     /// not collide. The suffix carries the extension the test needs.
+    ///
+    /// The clock alone is not enough: tests run on parallel threads and some platforms
+    /// tick coarsely, so two tests asking for the same suffix can read the same instant.
+    /// The process id separates concurrent test binaries and the counter separates
+    /// threads within one.
     fn unique_temp_path(suffix: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("decayfmt_test_{}_{}", nanos, suffix))
+        std::env::temp_dir().join(format!(
+            "decayfmt_test_{}_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            suffix
+        ))
     }
 
     #[test]
@@ -281,6 +294,36 @@ mod tests {
 
         let _ = fs::remove_file(&input);
         let _ = fs::remove_file(&output);
+    }
+
+    #[test]
+    fn encode_bytes_matches_encode_file_and_names_its_source() {
+        let source = b"bytes that never touched the disk";
+        let output = unique_temp_path("memory.tdcy3");
+        encode_bytes(source, &output).expect("encode bytes should succeed");
+        let written = fs::read(&output).expect("read encoded file");
+        assert_eq!(
+            &written[HEADER_SIZE..],
+            source,
+            "in-memory text must be stored exactly as given"
+        );
+        let _ = fs::remove_file(&output);
+
+        // A failed decode must point at the buffer, not at the output path, which was
+        // never read and may not exist.
+        let image_output = unique_temp_path("memory.idcy3");
+        let error = encode_bytes(b"not an image", &image_output)
+            .expect_err("undecodable bytes must be refused");
+        assert!(matches!(error, DecayError::ImageDecode { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains(IN_MEMORY_SOURCE),
+            "'{message}' should name the in-memory source"
+        );
+        assert!(
+            !image_output.exists(),
+            "a refused encode must not leave an output file behind"
+        );
     }
 
     #[test]

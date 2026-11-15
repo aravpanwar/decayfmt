@@ -52,7 +52,7 @@ fn main() -> ExitCode {
     // Running this for every command, rather than only inside open, means an encode or
     // a failed open also clears the snapshot of a past decay state that the previous
     // display left in the temp directory.
-    decayfmt::open::cleanup_old_view_files();
+    decayfmt::open::sweep_stale_view_files();
 
     let result = match cli.command {
         Command::Encode { input, output } => decayfmt::encode::encode_file(&input, &output),
