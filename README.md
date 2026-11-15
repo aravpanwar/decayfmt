@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/aravpanwar/decayfmt/actions/workflows/ci.yml/badge.svg)](https://github.com/aravpanwar/decayfmt/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/decayfmt.svg)](https://crates.io/crates/decayfmt)
-[![PyPI](https://img.shields.io/pypi/v/decayfmt-py.svg)](https://pypi.org/project/decayfmt-py/)
 
 _Featured in [This Week in Rust #660](https://this-week-in-rust.org/blog/2026/07/15/this-week-in-rust-660/)._
 
@@ -172,37 +171,26 @@ decayfmt open clip.adcy5
 
 `x` is read from the filename, so renaming the file changes how hard the next open hits.
 
-## Python
+## As a library
 
-The same library is available from Python as the `decayfmt` package, with the same format,
-same statistics, same errors as the CLI:
+The CLI is a thin layer over the `decayfmt` crate, which exposes the same format,
+statistics, and errors to Rust code:
 
-```
-pip install decayfmt-py
-```
+```rust
+use decayfmt::corrupt::corrupt;
+use decayfmt::format::FileType;
 
-```python
-import decayfmt
-
-decayfmt.encode_file("notes.txt", "notes.tdcy5")
-
-# Each open permanently corrupts the file on disk.
-for _ in range(5):
-    kind, dims, data = decayfmt.decay_file("notes.tdcy5")
-    print(data[16:].decode("utf-8", errors="replace"))
-
-# Or decay bytes in memory, no files involved:
-data = b"the quick brown fox jumps over the lazy dog"
-for _ in range(8):
-    data = decayfmt.corrupt_bytes(data, 1.0, "text")
+// Decay bytes in memory, no files involved.
+let mut data = b"the quick brown fox jumps over the lazy dog".to_vec();
+corrupt(&mut data, FileType::Text, 1.0);
 ```
 
-The binding exposes `corrupt_bytes` (copy out), `corrupt_in_place` (zero-copy on a
-`bytearray`), `encode_file`, `encode_bytes`, `decay_file` (open without display),
-`parse_filename`, `read_header`, and `write_header`. The GIL is released while
-corruption runs, and large payloads are corrupted in parallel across cores. Full
-documentation is on [PyPI](https://pypi.org/project/decayfmt-py/) and in
-[`python/README.md`](python/README.md).
+`decayfmt::encode::encode_file` and `decayfmt::open::decay_in_place` are the encode and
+open flows without the display step.
+
+The Python package `decayfmt-py` is no longer maintained. Its final release, 0.2.1,
+stays on [PyPI](https://pypi.org/project/decayfmt-py/) and reads files written by
+decayfmt 0.2.
 
 ## Performance
 

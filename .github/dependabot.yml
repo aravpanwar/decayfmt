@@ -1,10 +1,9 @@
 version: 2
 
-# Dependabot opens a pull request when a dependency updates, and the existing ci and
-# python workflows run against it. Monthly rather than weekly: with seven direct crates
-# and a handful of actions, anything more frequent is noise.
+# Dependabot opens a pull request when a dependency updates, and the existing ci
+# workflow runs against it. Monthly rather than weekly: with seven direct crates and a
+# handful of actions, anything more frequent is noise.
 updates:
-  # The workspace covers both the root crate and python/, so one entry handles both.
   - package-ecosystem: cargo
     directory: /
     schedule:

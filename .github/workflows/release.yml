@@ -82,8 +82,6 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: publish
-        # The workspace contains decayfmt-py, which is publish = false and ships to
-        # PyPI instead, so only the root crate is published here.
-        run: cargo publish --package decayfmt
+        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

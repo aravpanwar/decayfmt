@@ -1,6 +1,6 @@
 [package]
 name = "decayfmt"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A file format where decay is a first-class property. Every open permanently corrupts the file."
 license = "MIT"
@@ -34,8 +34,3 @@ harness = false
 [[bench]]
 name = "encode"
 harness = false
-
-[workspace]
-members = ["python"]
-default-members = ["."]
-resolver = "2"

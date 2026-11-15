@@ -3,8 +3,8 @@
 //! Builds one 2048x2048 RGBA image (16 MiB raw payload) and one 16 MiB text
 //! source, saves each once outside the timed region, then times
 //! `encode::encode_file` repeatedly on the same pair of paths. Reports
-//! wall-time per encode; the numbers bound what any client (CLI or Python)
-//! can achieve end to end, since PNG decode and disk I/O dominate.
+//! wall-time per encode; the numbers bound what any client can achieve end to
+//! end, since PNG decode and disk I/O dominate.
 //!
 //! Usage: `cargo bench --bench encode` (release profile by default).
 
